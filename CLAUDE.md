@@ -2,6 +2,7 @@
 
 个人使用的股票推荐回测工具:输入 Excel(每天手动更新的股票推荐列表),从 tushare 拉日线行情,计算收益/回撤,网页按日期查看每日持仓。
 
+
 ## 运行
 
 ```bash
@@ -25,7 +26,7 @@
 
 ## 规则契约
 
-规则函数签名:`decide(date, holdings, bars, recs) -> list[Action]`,`Action(op, code, weight)`,`op ∈ {buy, sell}`。当前规则:推荐起始日开盘买入,持有第 10 个交易日收盘卖出(见 rules.py `make_hold_n_days(10)`,天数可调)。规则带内部状态(持有天数/已卖集合),app.py 每次回测新建实例;改规则只动 rules.py。
+规则函数签名:`decide(date, holdings, bars, recs) -> list[Action]`,`Action(op, pos, weight)`,`op ∈ {buy, sell, sell_open}`(买入均开盘价;sell=收盘卖,sell_open=开盘卖,开盘卖当日收益=开盘涨跌幅)。`recs` 条目为 `(pos, ts_code, name, start_date, score)`,`pos` 是推荐唯一键,每条推荐是独立交易。当前规则:攻防转换(完整口径见 RULES.md,参数在 config.py 策略参数区):仓位 ≥ x 进攻持最近 y 条推荐,否则防守持最近 z 条防守列表;调仓一律开盘价成交,同股新旧仓同日合并不交易;引擎 fee 参数计手续费(费率在 config.py)。规则带状态,app.py 每次回测新建实例;改规则只动 rules.py。
 
 ## 约定
 
@@ -42,10 +43,11 @@
 
 ## 已知简化(v1)
 
-智能评分汇总行、万德全A基准对比未做;买入按开盘、卖出按收盘;同股多条推荐按代码去重(最早日期、最高评分)。
+智能评分汇总行、万德全A基准对比未做;买入按开盘、卖出按收盘;同一天同股多条推荐会开成两笔相同持仓(各自独立计算)。
 
 ## 常见问题
 
 - tushare 限流:重试 4 次仍失败→该股票记跳过,下次点更新自动补
 - 名称匹配不上:侧边栏警告列出,可点"刷新股票名称表"
+- 改 config.py 策略参数(x/y/z/费率):保存后 ~2 秒页面自动重算(内置 fragment 监视文件);改 token/路径仍需重启
 - 输出旧版对照:旧脚本/旧数据在 `C:\workspace\python_mybasic\`(只读参考,勿改动)

@@ -32,17 +32,22 @@ def _call_with_retry(func, *args, **kwargs):
             last_err = e
             if i < MAX_RETRY - 1:
                 wait = 2 ** (i + 1)  # 2/4/8 秒
-                print(f"⚠️ tushare 调用失败,第{i + 1}次重试({wait}秒后):{str(e)[:120]}")
+                print(f"[WARN] tushare 调用失败,第{i + 1}次重试({wait}秒后):{str(e)[:120]}")
                 time.sleep(wait)
     raise last_err
 
 
 def get_ts_code(symbol: str) -> str:
-    """代码后缀推断:5 位→.HK(先判断,港股 00700 这类 0 开头代码不会被误判),6→.SH, 0/3→.SZ。
+    """代码后缀推断:5 位→.HK(先判断,港股 00700 这类 0 开头代码不会被误判);
+    5/1 开头→场内基金 ETF(5 开头 .SH,1 开头 .SZ);6→.SH, 0/3→.SZ。
     旧脚本顺序有 bug(0 开头港股被误判为 .SZ,靠兜底接口才碰巧工作),这里已修正。"""
     symbol = str(symbol).strip()
     if len(symbol) == 5:
         return f"{symbol}.HK"
+    if symbol.startswith("5"):
+        return f"{symbol}.SH"
+    if symbol.startswith("1"):
+        return f"{symbol}.SZ"
     if symbol.startswith("6"):
         return f"{symbol}.SH"
     if symbol.startswith(("0", "3")):
@@ -50,14 +55,23 @@ def get_ts_code(symbol: str) -> str:
     return symbol
 
 
+def is_etf(ts_code: str) -> bool:
+    """场内基金判定(用于费率选择):6 位代码 5/1 开头的 .SH/.SZ。"""
+    sym = ts_code.split(".")[0]
+    return len(sym) == 6 and sym.startswith(("5", "1")) and ts_code.endswith((".SH", ".SZ"))
+
+
 def fetch_daily(ts_code: str, start: str, end: str) -> pd.DataFrame:
-    """拉日线。HK 代码先用 pro.daily 再兜底 pro.hk_daily(与原脚本顺序一致)。
+    """拉日线。兜底顺序:pro.daily → ETF 用 pro.fund_daily → .HK 用 pro.hk_daily。
     start/end 为 'YYYY-MM-DD',API 用 'YYYYMMDD'。
     """
     start8, end8 = start.replace("-", ""), end.replace("-", "")
     df = _call_with_retry(pro.daily, ts_code=ts_code, start_date=start8, end_date=end8)
-    if (df is None or df.empty) and ts_code.endswith(".HK"):
-        df = _call_with_retry(pro.hk_daily, ts_code=ts_code, start_date=start8, end_date=end8)
+    if df is None or df.empty:
+        if ts_code.endswith(".HK"):
+            df = _call_with_retry(pro.hk_daily, ts_code=ts_code, start_date=start8, end_date=end8)
+        elif is_etf(ts_code):
+            df = _call_with_retry(pro.fund_daily, ts_code=ts_code, start_date=start8, end_date=end8)
     if df is None or df.empty:
         return pd.DataFrame()
     df = df.copy()
@@ -78,14 +92,24 @@ def fetch_trade_calendar(start: str, end: str) -> pd.DataFrame:
 
 
 def fetch_name_map() -> pd.DataFrame:
-    """全市场名称→代码映射(A 股 + 港股)。"""
+    """全市场名称→代码映射(A 股 + 港股 + 场内基金)。"""
     df_a = _call_with_retry(pro.stock_basic, exchange="", list_status="L",
                             fields="ts_code,symbol,name")
     df_hk = _call_with_retry(pro.hk_basic, fields="ts_code,symbol,name")
     if df_a is None or df_hk is None:
         raise RuntimeError("股票列表拉取失败")
-    df = pd.concat([df_a, df_hk], ignore_index=True)
+    # 场内基金(ETF/LOF):market='E' 只取场内,避免场外基金代码与股票冲突
+    df_fund = _call_with_retry(pro.fund_basic, market="E", fields="ts_code,name")
+    parts = [df_a, df_hk]
+    if df_fund is not None and not df_fund.empty:
+        df_fund = df_fund.copy()
+        df_fund["symbol"] = df_fund["ts_code"].str.split(".").str[0]
+        df_fund["market"] = "ETF"
+        parts.append(df_fund[["symbol", "name", "ts_code", "market"]])
+    df = pd.concat(parts, ignore_index=True)
     df["market"] = df["ts_code"].str.split(".").str[1].map({"SH": "A", "SZ": "A", "BJ": "A"}).fillna("HK")
+    if df_fund is not None and not df_fund.empty:
+        df.loc[df["symbol"].isin(df_fund["symbol"]), "market"] = "ETF"
     df = df.dropna(subset=["symbol", "name"]).drop_duplicates(subset=["symbol"])
     df["symbol"] = df["symbol"].astype(str).str.strip()
     df["name"] = df["name"].astype(str).str.strip()
@@ -158,13 +182,13 @@ def ensure_name_map(db_path=DB_PATH, force: bool = False) -> int:
         count = conn.execute("SELECT COUNT(*) FROM stock_names").fetchone()[0]
         if count > 0 and not force:
             return count
-        print("📌 正在拉取全部股票列表,初始化名称→代码映射...")
+        print("[INFO] 正在拉取全部股票列表,初始化名称→代码映射...")
         df = fetch_name_map()
         if df.empty:
             raise RuntimeError("股票列表拉取失败")
         df.to_sql("stock_names", conn, if_exists="replace", index=False)
         _set_meta(conn, "name_map_update", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-        print(f"✅ 名称→代码映射完成,共 {len(df)} 只股票")
+        print(f"[OK] 名称→代码映射完成,共 {len(df)} 只股票")
         return len(df)
 
 
@@ -197,7 +221,7 @@ def resolve_names(names: list[str], db_path=DB_PATH) -> dict:
             result[name] = _match_one(name, conn)
     missing = [n for n, v in result.items() if v is None]
     if missing:
-        print(f"⚠️ {len(missing)} 个名称未匹配,刷新名称表后重试一次...")
+        print(f"[WARN] {len(missing)} 个名称未匹配,刷新名称表后重试一次...")
         ensure_name_map(db_path, force=True)
         with _connect(db_path) as conn:
             for name in missing:
@@ -251,7 +275,9 @@ def update_market_data(recs: pd.DataFrame, progress_cb=None, db_path=DB_PATH) ->
     init_db(db_path)
     stats = {"updated": 0, "new_rows": 0, "skipped": [], "elapsed": 0.0}
     t0 = time.time()
-    unique_recs = recs.drop_duplicates(subset=["ts_code"])
+    # 同股多条推荐只拉一次行情,起始日取最早,保证首次拉取覆盖全部推荐区间
+    unique_recs = (recs.sort_values("start_date")
+                   .drop_duplicates(subset=["ts_code"], keep="first"))
     with _connect(db_path) as conn:
         for i, (_, row) in enumerate(unique_recs.iterrows()):
             ts_code, start_date = row["ts_code"], row["start_date"]

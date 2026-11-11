@@ -3,15 +3,19 @@ r"""股票推荐回测 Web 应用(Streamlit 唯一入口)。
 运行: .venv\Scripts\python.exe -m streamlit run app.py
 """
 from datetime import datetime
+import importlib
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 
+import config
 import data_fetcher as fetcher
 import backtest
-from config import TS_TOKEN, DB_PATH, INPUT_DIR, OUTPUT_DIR, EXCEL_COLUMNS
-from rules import make_hold_n_days
+from config import (TS_TOKEN, DB_PATH, INPUT_DIR, OUTPUT_DIR, EXCEL_COLUMNS,
+                    REGIME_FILE_NAME)
+from rules import make_hold_n_days, make_regime_rule
 
 st.set_page_config(page_title="股票推荐回测", layout="wide",
                    initial_sidebar_state="expanded")
@@ -67,7 +71,91 @@ def parse_excel(source) -> dict:
             "dropped_dates": dropped_dates, "total": len(names)}
 
 
-# ====================== 缓存读取(以 data_version 失效) ======================
+def parse_regime_file(path):
+    """读仓位/防守文件(结构见 RULES.md):「仓位」sheet → 攻防区间;
+    「防守」sheet → 防守列表,股票代码列有值直接推断代码,缺代码用名称匹配。"""
+    xls = pd.ExcelFile(path, engine="openpyxl")
+    pos_df = xls.parse("仓位")
+    regime = []
+    for _, r in pos_df.iterrows():
+        s = pd.to_datetime(r.get("起始日期"), errors="coerce")
+        e = pd.to_datetime(r.get("结束日期"), errors="coerce")
+        p = pd.to_numeric(r.get("仓位"), errors="coerce")
+        if pd.isna(s) or pd.isna(e) or pd.isna(p):
+            continue
+        regime.append((s.strftime("%Y-%m-%d"), e.strftime("%Y-%m-%d"), float(p)))
+
+    def_df = xls.parse("防守")
+    def_df = def_df.dropna(subset=["起始日期"]).copy()
+    def_df["_date"] = pd.to_datetime(def_df["起始日期"], errors="coerce").dt.strftime("%Y-%m-%d")
+    def_df = def_df[def_df["_date"].notna()]
+    need_resolve = []
+    for _, r in def_df.iterrows():
+        code = r.get("股票代码")
+        if code is None or pd.isna(code) or not str(code).strip():
+            raw_name = r.get("股票名称")
+            name = "" if raw_name is None or pd.isna(raw_name) else str(raw_name).strip()
+            if name:
+                need_resolve.append(name)
+    resolved = fetcher.resolve_names(need_resolve) if need_resolve else {}
+    defense = []
+    for i, (_, r) in enumerate(def_df.iterrows()):
+        code = r.get("股票代码")
+        raw_name = r.get("股票名称")
+        name = "" if raw_name is None or pd.isna(raw_name) else str(raw_name).strip()
+        ts_code = None
+        if code is not None and not pd.isna(code) and str(code).strip():
+            ts_code = fetcher.get_ts_code(str(code).strip())
+        else:
+            hit = resolved.get(name)
+            if hit is None:
+                continue
+            ts_code, name = hit[1], hit[3]
+        defense.append((f"D{i}", ts_code, name, r["_date"], 0.0))
+    return {"regime": regime, "defense": defense}
+
+
+def _parse_regime_into_state(path):
+    """按文件修改时间缓存仓位/防守解析结果。"""
+    mkey = f"regime:{path.name}:{path.stat().st_mtime_ns}"
+    if st.session_state.get("_regime_mkey") == mkey:
+        return
+    try:
+        st.session_state.regime_data = parse_regime_file(path)
+        st.session_state._regime_mkey = mkey
+    except Exception as e:
+        st.error(f"仓位/防守文件解析失败:{e}")
+
+
+# ====================== 策略参数(每次页面重跑重读;保存 config.py 后 ~2 秒自动生效) ======================
+def _strategy_params():
+    """主动 reload config 读策略参数。
+
+    不用模块顶部 from-import:Python 缓存模块,页面重跑只会拿到旧值。
+    config.py 是纯数据文件,reload 无副作用。token/路径变更仍需重启。
+    """
+    importlib.reload(config)
+    return config.X_THRESHOLD, config.Y_OFFENSE, config.Z_DEFENSE, config.FEE
+
+
+_CONFIG_PATH = Path(config.__file__)
+
+
+@st.fragment(run_every=2)
+def _watch_config():
+    """每 2 秒检查 config.py 修改时间,变化则整页重跑(重读参数→缓存失效→重算)。
+
+    必须用 fragment 轮询:st.tabs 切 tab、展开收起等是纯前端操作,不触发脚本重跑,
+    仅靠交互永远等不到参数生效。fragment 定时器独立于主脚本,页面开着就一直监视。
+    """
+    mtime = _CONFIG_PATH.stat().st_mtime_ns
+    prev = st.session_state.get("_cfg_mtime")
+    st.session_state._cfg_mtime = mtime
+    if prev is not None and mtime != prev:
+        st.rerun(scope="app")
+
+
+_watch_config()
 @st.cache_data(show_spinner=False)
 def _load_market(db_key: str, version: int) -> pd.DataFrame:
     return fetcher.load_market_data(db_key)
@@ -78,14 +166,29 @@ def _load_trade_dates(db_key: str, version: int) -> list:
     return fetcher.load_trade_dates(db_key)
 
 
+# 策略参数作为 _run_backtest 签名的一部分:参数值变化 → 缓存自动失效重算
 @st.cache_data(show_spinner=False)
-def _run_backtest(recs_tuple: tuple, db_key: str, version: int):
+def _run_backtest(recs_tuple: tuple, regime_key, db_key: str, version: int,
+                  x: float, y: int, z: int, fee: dict):
     recs = pd.DataFrame(list(recs_tuple),
                         columns=["ts_code", "name", "start_date", "score"])
     market = _load_market(db_key, version)
     trade_dates = _load_trade_dates(db_key, version)
-    rule = make_hold_n_days(10)  # 持有天数在此调整;每次重跑新建实例,规则内部状态从零开始
-    return backtest.run_backtest(recs, market, trade_dates, rule=rule)
+    if regime_key is None:
+        rule = make_hold_n_days(10)  # 仓位/防守文件缺失时的退回规则;每次重跑新建实例
+        recs_all = recs
+    else:
+        regime, defense = regime_key
+        # 防守行并入 recs 交给引擎(pos 编号接在进攻之后),引擎才知道防守代码、能执行买入
+        base = len(recs)
+        defense = [(base + i, ts_code, name, start_date, score)
+                   for i, (_pid, ts_code, name, start_date, score) in enumerate(defense)]
+        recs_all = pd.concat(
+            [recs, pd.DataFrame([d[1:] for d in defense],
+                                columns=["ts_code", "name", "start_date", "score"])],
+            ignore_index=True)
+        rule = make_regime_rule(list(regime), defense, x, y, z)
+    return backtest.run_backtest(recs_all, market, trade_dates, rule=rule, fee=fee)
 
 
 # ====================== 图表 ======================
@@ -204,6 +307,14 @@ with st.sidebar:
 
     recs = st.session_state.get("recs")
 
+    # 仓位/防守文件(RULES.md):固定读 input/ 下配置名,改文件后自动重解析
+    regime_path = INPUT_DIR / REGIME_FILE_NAME
+    if regime_path.exists():
+        _parse_regime_into_state(regime_path)
+    else:
+        st.warning(f"未找到 {REGIME_FILE_NAME},将退回「持有10个交易日」规则")
+    regime_data = st.session_state.get("regime_data")
+
     st.markdown("### ② 行情数据")
     if not TS_TOKEN:
         st.error("config.py 中 TS_TOKEN 为空。请把旧脚本第 55 行的 token 粘贴到 config.py 后重启。")
@@ -214,7 +325,13 @@ with st.sidebar:
             else:
                 with st.status("更新行情数据中...", expanded=True) as status:
                     try:
-                        min_date = recs["start_date"].min()
+                        fetch_all = recs
+                        if regime_data:
+                            defense_recs = pd.DataFrame(
+                                regime_data["defense"],
+                                columns=["pos", "ts_code", "name", "start_date", "score"])
+                            fetch_all = pd.concat([recs, defense_recs], ignore_index=True)
+                        min_date = fetch_all["start_date"].min()
                         fetcher.ensure_trade_calendar(min_date,
                                                       datetime.now().strftime("%Y-%m-%d"))
                         bar = st.progress(0.0)
@@ -224,7 +341,7 @@ with st.sidebar:
                             bar.progress((i + 1) / n)
                             txt.text(f"拉取 {name} ({i + 1}/{n})")
 
-                        stats = fetcher.update_market_data(recs, progress_cb=cb)
+                        stats = fetcher.update_market_data(fetch_all, progress_cb=cb)
                         bar.progress(1.0)
                         txt.text("完成")
                         st.write(f"更新 {stats['updated']} 只股票,新增 {stats['new_rows']} 行,"
@@ -260,7 +377,12 @@ else:
     db_key = str(DB_PATH)
     recs_tuple = tuple(recs[["ts_code", "name", "start_date", "score"]]
                        .itertuples(index=False, name=None))
-    daily_holdings, portfolio, summary = _run_backtest(recs_tuple, db_key, version)
+    regime_key = None
+    if regime_data:
+        regime_key = (tuple(regime_data["regime"]), tuple(regime_data["defense"]))
+    x_th, y_off, z_def, fee = _strategy_params()
+    daily_holdings, portfolio, summary = _run_backtest(
+        recs_tuple, regime_key, db_key, version, x_th, y_off, z_def, fee)
 
     if portfolio.empty:
         st.info("数据库中还没有行情数据。点击侧边栏「初始化/更新行情数据」按钮。")
@@ -290,7 +412,7 @@ else:
                                 "当日涨跌", "累计收益", "交易天数"]
                 st.dataframe(style_holdings(show), width="stretch",
                              hide_index=True)
-                st.caption(f"共 {len(show)} 只持仓 | 当日涨跌=全日涨跌幅,"
+                st.caption(f"共 {len(show)} 笔持仓(同股多轮推荐各算一笔) | 当日涨跌=全日涨跌幅,"
                            f"买入日取实体涨幅(开盘→收盘);累计收益自买入日起复利")
 
     # ---------- Tab2 组合净值 ----------
@@ -301,12 +423,13 @@ else:
             sel_dt = st.select_slider("推进日期", options=dates, value=dates[-1],
                                       key="nav_slider")
             row = portfolio[portfolio["date"] == sel_dt].iloc[0]
-            m1, m2, m3, m4 = st.columns(4)
+            m1, m2, m3, m4, m5 = st.columns(5)
             m1.metric("净值", f"{row['nav']:.4f}")
             m2.metric("当日收益",
                       f"{row['avg_return']:.2%}" if row["avg_return"] is not None else "—")
             m3.metric("回撤", f"{row['drawdown']:.2%}")
             m4.metric("持仓数", f"{int(row['n_stocks'])} 只")
+            m5.metric("当日费用", f"{row['fee']:.4%}")
             sel_dt_v = pd.to_datetime(sel_dt)
             st.plotly_chart(fig_daily_returns(portfolio, sel_dt_v),
                             width="stretch")
@@ -327,15 +450,20 @@ else:
             st.dataframe(style_holdings(show), width="stretch", hide_index=True)
             issues = []
             if st.session_state.get("unmatched"):
-                issues.append(f"未匹配代码(已排除):{'、'.join(st.session_state.unmatched)}")
+                issues.append(f"未匹配代码(已排除):{'、'.join(dict.fromkeys(st.session_state.unmatched))}")
             if st.session_state.get("dropped"):
                 issues.append(f"起始日期无效(已丢弃 {st.session_state.dropped} 行)")
             no_data = summary[summary["status"] == "无行情数据"]
             if not no_data.empty:
-                issues.append(f"无行情数据:{'、'.join(no_data['name'].tolist())}")
+                issues.append(f"无行情数据:{'、'.join(dict.fromkeys(no_data['name']))}")
+            not_entered = summary[summary["status"] == "未进场"]
+            if not not_entered.empty:
+                issues.append(f"未进场 {len(not_entered)} 条(有行情但未进入最近 y 条目标窗口,"
+                              f"多为防守期发布的推荐,策略上不买入):"
+                              f"{'、'.join(dict.fromkeys(not_entered['name']))[:120]}…")
             pending = summary[summary["status"] == "未到买入日"]
             if not pending.empty:
-                issues.append(f"未到买入日(推荐日晚于最新行情):{'、'.join(pending['name'].tolist())}")
+                issues.append(f"未到买入日(推荐日晚于最新行情):{'、'.join(dict.fromkeys(pending['name']))}")
             if issues:
                 with st.expander(f"问题清单({len(issues)})"):
                     for s in issues:
