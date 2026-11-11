@@ -8,6 +8,7 @@
 - 卖出分两种:"sell" 按当日收盘(旧规则,当日仍计收益);"sell_open" 按当日开盘
   (攻防规则),卖出腿当日收益 = 开盘涨跌幅(开盘/昨收-1);买入一律当日开盘
 - 手续费(fee 参数,费率见 config.py)按成交金额计,从当日组合净值扣减
+- 停牌日(当日无行情)买卖动作一律跳过:持仓保留,规则下个交易日自然重发
 """
 import pandas as pd
 
@@ -93,18 +94,20 @@ def run_backtest(recs: pd.DataFrame, market: pd.DataFrame, trade_dates: list[str
         for act in actions:
             if act.op in ("sell", "sell_open") and act.pos in holdings:
                 h = holdings[act.pos]
-                r = None
                 bar = day_bars.get(h.code)
-                if bar is not None:
-                    if act.op == "sell_open":
-                        r = gap_return(bar["open"], bar["pre_close"])
-                    else:
-                        r = daily_return(bar["pct_chg"])
-                    trade_day_count[act.pos] = trade_day_count.get(act.pos, 0) + 1
-                    last_bar_date[act.pos] = date
-                    if fee is not None:
-                        rate = fee["etf_sell"] if is_etf(h.code) else fee["stock_sell"]
-                        fee_day += (1.0 / n_before) * rate
+                if bar is None:
+                    # 停牌无法成交:保留持仓,规则下个交易日自然重发(与买入跳过同口径,
+                    # RULES.md:顺延到下一个有行情的交易日按开盘执行)
+                    continue
+                if act.op == "sell_open":
+                    r = gap_return(bar["open"], bar["pre_close"])
+                else:
+                    r = daily_return(bar["pct_chg"])
+                trade_day_count[act.pos] = trade_day_count.get(act.pos, 0) + 1
+                last_bar_date[act.pos] = date
+                if fee is not None:
+                    rate = fee["etf_sell"] if is_etf(h.code) else fee["stock_sell"]
+                    fee_day += (1.0 / n_before) * rate
                 if r is not None:
                     h = h._replace(cum_return=round((1 + (h.cum_return or 0)) * (1 + r) - 1, 6))
                     sold_today[act.pos] = (r, 1.0 if h.weight is None else float(h.weight))

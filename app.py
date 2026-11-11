@@ -98,8 +98,8 @@ def parse_regime_file(path):
             if name:
                 need_resolve.append(name)
     resolved = fetcher.resolve_names(need_resolve) if need_resolve else {}
-    defense = []
-    for i, (_, r) in enumerate(def_df.iterrows()):
+    rows = []
+    for _, r in def_df.iterrows():
         code = r.get("股票代码")
         raw_name = r.get("股票名称")
         name = "" if raw_name is None or pd.isna(raw_name) else str(raw_name).strip()
@@ -111,7 +111,13 @@ def parse_regime_file(path):
             if hit is None:
                 continue
             ts_code, name = hit[1], hit[3]
-        defense.append((f"D{i}", ts_code, name, r["_date"], 0.0))
+        rows.append((ts_code, name, r["_date"]))
+    # 同代码去重:同一标的写多行会开成两笔仓、权重翻倍,只保留起始日期最新的一行
+    by_code = {}
+    for ts_code, name, d in rows:
+        if ts_code not in by_code or d > by_code[ts_code][2]:
+            by_code[ts_code] = (ts_code, name, d)
+    defense = [(f"D{k}", *row, 0.0) for k, row in enumerate(by_code.values())]
     return {"regime": regime, "defense": defense}
 
 
@@ -291,7 +297,8 @@ def parse_into_state(path):
 with st.sidebar:
     st.markdown("### ① 输入 Excel")
     uploaded = st.file_uploader("上传 Excel(xlsx)", type=["xlsx"])
-    existing_files = sorted(INPUT_DIR.glob("*.xlsx"))
+    existing_files = sorted(f for f in INPUT_DIR.glob("*.xlsx")
+                            if not f.name.startswith("~$"))  # 排除 Excel 锁文件
     existing = st.selectbox("或选择 input/ 目录已有文件",
                             ["— 不选择 —"] + [f.name for f in existing_files])
 

@@ -67,11 +67,14 @@ def make_regime_rule(regime, defense_recs, x, y, z):
 
     每日目标持仓 = 当前攻防状态对应的"最近 k 条"(起始日期 <= 当日),与当前持仓按 ts_code 差分:
     - 差集卖出、新增买入,一律当日开盘价成交(卖出用 sell_open,引擎按开盘涨跌幅计当日收益)
-    - 同股"卖旧 + 买新"同日发生 → 保留旧仓不开新仓,当日零交易(省手续费,entry 不变)
-    - 停牌日无法成交,规则次日自然重发(持仓未变即重发)
+    - 进攻窗口只统计选中 Excel 的推荐(引擎传入的 recs 已并入防守行,按 pos 排除)
+    - 同股"卖旧 + 买新"同日 → 合并成一笔:保留最早进场的旧仓(entry 不变,省手续费),
+      多余旧仓照常卖出、新仓不开
+    - 停牌日无法成交,引擎跳过当日动作,规则次日自然重发(持仓未变即重发)
     组合时刻满仓等权,权重由引擎归一化。
     """
     defense = list(defense_recs)
+    defense_pos = {p for p, *_ in defense}
 
     def regime_position(date):
         for start, end, position in regime:
@@ -90,7 +93,9 @@ def make_regime_rule(regime, defense_recs, x, y, z):
     def rule(date, holdings, bars, recs):
         position = regime_position(date)
         if position is not None and position >= x:
-            target = target_keys(recs, y)       # 进攻:页面选中 Excel 的最近 y 条
+            # 进攻只看选中 Excel 的推荐:引擎传入的 recs 已并入防守行,按 pos 排除
+            offense = [r for r in recs if r[0] not in defense_pos]
+            target = target_keys(offense, y)
         else:
             target = target_keys(defense, z)    # 防守:防守 sheet 的最近 z 条
 
@@ -98,17 +103,21 @@ def make_regime_rule(regime, defense_recs, x, y, z):
         buy = [p for p in target if p not in holdings]
         code_of = {pos: ts_code for pos, ts_code, *_ in recs}
         code_of.update({pos: ts_code for pos, ts_code, *_ in defense})
-        sell_codes = {p: holdings[p].code for p in sell}
         buy_codes = {p: code_of.get(p) for p in buy}
-        merge = {c for c in sell_codes.values() if c in set(buy_codes.values())}
 
-        actions = []
-        for p in sell:
-            if sell_codes[p] not in merge:
-                actions.append(Action("sell_open", p, None))
-        for p in buy:
-            if buy_codes[p] not in merge:
-                actions.append(Action("buy", p, None))
+        # 同股"卖旧 + 买新"同日 → 合并成一笔:每代码只保留最早进场的一笔旧仓
+        # (entry 不变,省手续费),对应新仓不开;多余旧仓照常卖出,否则同股多笔
+        # 旧仓会被整体跳过、权重翻倍并永久卡死。
+        merged_codes = {holdings[p].code for p in sell} & {c for c in buy_codes.values() if c}
+        keep_pos = set()
+        for c in merged_codes:
+            olds = sorted((p for p in sell if holdings[p].code == c),
+                          key=lambda p: (holdings[p].entry_date, p))
+            keep_pos.add(olds[0])
+        keep_codes = {holdings[p].code for p in keep_pos}
+
+        actions = [Action("sell_open", p, None) for p in sell if p not in keep_pos]
+        actions += [Action("buy", p, None) for p in buy if buy_codes[p] not in keep_codes]
         return actions
     return rule
 

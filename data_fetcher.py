@@ -16,8 +16,6 @@ from config import TS_TOKEN, DB_PATH, REQUEST_SLEEP, MAX_RETRY
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api(timeout=30)
 
-TODAY = datetime.now().strftime("%Y-%m-%d")
-
 
 # ====================== tushare 底层封装 ======================
 def _call_with_retry(func, *args, **kwargs):
@@ -40,8 +38,11 @@ def _call_with_retry(func, *args, **kwargs):
 def get_ts_code(symbol: str) -> str:
     """代码后缀推断:5 位→.HK(先判断,港股 00700 这类 0 开头代码不会被误判);
     5/1 开头→场内基金 ETF(5 开头 .SH,1 开头 .SZ);6→.SH, 0/3→.SZ。
-    旧脚本顺序有 bug(0 开头港股被误判为 .SZ,靠兜底接口才碰巧工作),这里已修正。"""
+    旧脚本顺序有 bug(0 开头港股被误判为 .SZ,靠兜底接口才碰巧工作),这里已修正。
+    Excel 数字单元格读出的 "510300.0" 之类会先去掉 ".0"。"""
     symbol = str(symbol).strip()
+    if symbol.endswith(".0") and symbol[:-2].isdigit():
+        symbol = symbol[:-2]
     if len(symbol) == 5:
         return f"{symbol}.HK"
     if symbol.startswith("5"):
@@ -275,6 +276,7 @@ def update_market_data(recs: pd.DataFrame, progress_cb=None, db_path=DB_PATH) ->
     init_db(db_path)
     stats = {"updated": 0, "new_rows": 0, "skipped": [], "elapsed": 0.0}
     t0 = time.time()
+    today = datetime.now().strftime("%Y-%m-%d")  # 每次调用现取:页面长开跨天也能拉到新数据
     # 同股多条推荐只拉一次行情,起始日取最早,保证首次拉取覆盖全部推荐区间
     unique_recs = (recs.sort_values("start_date")
                    .drop_duplicates(subset=["ts_code"], keep="first"))
@@ -289,11 +291,11 @@ def update_market_data(recs: pd.DataFrame, progress_cb=None, db_path=DB_PATH) ->
                     "SELECT MIN(trade_date), MAX(trade_date) FROM daily_bars WHERE ts_code=?",
                     (ts_code,)).fetchone()
                 if row_min is None:
-                    pull_start, pull_end = start_date, TODAY
+                    pull_start, pull_end = start_date, today
                 else:
                     pull_start = str((datetime.strptime(row_max, "%Y-%m-%d") +
                                       timedelta(days=1)).date())
-                    pull_end = TODAY
+                    pull_end = today
                 if pull_start > pull_end:
                     continue  # 已是最新
                 df = fetch_daily(ts_code, pull_start, pull_end)

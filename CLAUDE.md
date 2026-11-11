@@ -26,7 +26,7 @@
 
 ## 规则契约
 
-规则函数签名:`decide(date, holdings, bars, recs) -> list[Action]`,`Action(op, pos, weight)`,`op ∈ {buy, sell, sell_open}`(买入均开盘价;sell=收盘卖,sell_open=开盘卖,开盘卖当日收益=开盘涨跌幅)。`recs` 条目为 `(pos, ts_code, name, start_date, score)`,`pos` 是推荐唯一键,每条推荐是独立交易。当前规则:攻防转换(完整口径见 RULES.md,参数在 config.py 策略参数区):仓位 ≥ x 进攻持最近 y 条推荐,否则防守持最近 z 条防守列表;调仓一律开盘价成交,同股新旧仓同日合并不交易;引擎 fee 参数计手续费(费率在 config.py)。规则带状态,app.py 每次回测新建实例;改规则只动 rules.py。
+规则函数签名:`decide(date, holdings, bars, recs) -> list[Action]`,`Action(op, pos, weight)`,`op ∈ {buy, sell, sell_open}`(买入均开盘价;sell=收盘卖,sell_open=开盘卖,开盘卖当日收益=开盘涨跌幅)。`recs` 条目为 `(pos, ts_code, name, start_date, score)`,`pos` 是推荐唯一键,每条推荐是独立交易。当前规则:攻防转换(完整口径见 RULES.md,参数在 config.py 策略参数区):仓位 ≥ x 进攻持最近 y 条推荐,否则防守持最近 z 条防守列表;调仓一律开盘价成交,同股新旧仓同日合并(保留最早进场旧仓、不开新仓);引擎 fee 参数计手续费(费率在 config.py)。规则带状态,app.py 每次回测新建实例;改规则只动 rules.py。
 
 ## 约定
 
