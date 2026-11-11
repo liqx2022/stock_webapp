@@ -29,7 +29,6 @@ NEUTRAL = "#1F4E79"    # 净值曲线
 MARKER = "#888888"     # 日期推进虚线
 GRID = "rgba(0,0,0,0.08)"
 GREEN_FILL = "rgba(46,125,50,0.25)"
-GRAY_BAR = "#BDBDBD"
 
 
 def _ensure_dirs():
@@ -43,7 +42,6 @@ def parse_excel(source) -> dict:
     df = pd.read_excel(source, engine="openpyxl")
     name_col = EXCEL_COLUMNS["name"]
     date_col = EXCEL_COLUMNS["date"]
-    score_col = EXCEL_COLUMNS["score"]
     missing = [c for c in EXCEL_COLUMNS.values() if c not in df.columns]
     if missing:
         raise ValueError(f"输入文件缺少必需列:{missing}")
@@ -54,7 +52,6 @@ def parse_excel(source) -> dict:
     df["_date"] = dates.dt.strftime("%Y-%m-%d")
     df = df[dates.notna()].reset_index(drop=True)
     names = names[dates.notna()].reset_index(drop=True)
-    df["_score"] = pd.to_numeric(df[score_col], errors="coerce").fillna(0)
 
     resolved = fetcher.resolve_names(names.tolist())
     rows, unmatched = [], []
@@ -65,8 +62,7 @@ def parse_excel(source) -> dict:
             continue
         symbol, ts_code, _market, db_name = r
         rows.append({"ts_code": ts_code, "name": db_name,
-                     "start_date": df["_date"].iloc[i],
-                     "score": df["_score"].iloc[i]})
+                     "start_date": df["_date"].iloc[i]})
     return {"recs": pd.DataFrame(rows), "unmatched": unmatched,
             "dropped_dates": dropped_dates, "total": len(names)}
 
@@ -117,7 +113,7 @@ def parse_regime_file(path):
     for ts_code, name, d in rows:
         if ts_code not in by_code or d > by_code[ts_code][2]:
             by_code[ts_code] = (ts_code, name, d)
-    defense = [(f"D{k}", *row, 0.0) for k, row in enumerate(by_code.values())]
+    defense = [(f"D{k}", *row) for k, row in enumerate(by_code.values())]
     return {"regime": regime, "defense": defense}
 
 
@@ -177,7 +173,7 @@ def _load_trade_dates(db_key: str, version: int) -> list:
 def _run_backtest(recs_tuple: tuple, regime_key, db_key: str, version: int,
                   x: float, y: int, z: int, fee: dict):
     recs = pd.DataFrame(list(recs_tuple),
-                        columns=["ts_code", "name", "start_date", "score"])
+                        columns=["ts_code", "name", "start_date"])
     market = _load_market(db_key, version)
     trade_dates = _load_trade_dates(db_key, version)
     if regime_key is None:
@@ -187,11 +183,11 @@ def _run_backtest(recs_tuple: tuple, regime_key, db_key: str, version: int,
         regime, defense = regime_key
         # 防守行并入 recs 交给引擎(pos 编号接在进攻之后),引擎才知道防守代码、能执行买入
         base = len(recs)
-        defense = [(base + i, ts_code, name, start_date, score)
-                   for i, (_pid, ts_code, name, start_date, score) in enumerate(defense)]
+        defense = [(base + i, ts_code, name, start_date)
+                   for i, (_pid, ts_code, name, start_date) in enumerate(defense)]
         recs_all = pd.concat(
             [recs, pd.DataFrame([d[1:] for d in defense],
-                                columns=["ts_code", "name", "start_date", "score"])],
+                                columns=["ts_code", "name", "start_date"])],
             ignore_index=True)
         rule = make_regime_rule(list(regime), defense, x, y, z)
     return backtest.run_backtest(recs_all, market, trade_dates, rule=rule, fee=fee)
@@ -211,14 +207,13 @@ def _base_layout(title: str, height: int, pct_y: bool) -> dict:
 
 
 def fig_daily_returns(portfolio: pd.DataFrame, sel_dt) -> go.Figure:
-    colors = [RED if v is not None and v >= 0 else
-              GREEN if v is not None else GRAY_BAR for v in portfolio["avg_return"]]
+    colors = [RED if v >= 0 else GREEN for v in portfolio["account_return"]]
     fig = go.Figure(go.Bar(
-        x=portfolio["_dt"], y=portfolio["avg_return"], marker_color=colors,
+        x=portfolio["_dt"], y=portfolio["account_return"], marker_color=colors,
         customdata=[[n] for n in portfolio["n_stocks"]],
-        hovertemplate="%{x|%Y-%m-%d}<br>当日收益 %{y:.2%}<br>持仓 %{customdata[0]} 只<extra></extra>",
+        hovertemplate="%{x|%Y-%m-%d}<br>账户收益 %{y:.2%}<br>持仓 %{customdata[0]} 只<extra></extra>",
     ))
-    fig.update_layout(**_base_layout("每日组合平均收益(红涨绿跌,柱形方向亦表涨跌)", 280, pct_y=True))
+    fig.update_layout(**_base_layout("每日账户收益(红涨绿跌,柱形方向亦表涨跌)", 280, pct_y=True))
     fig.add_vline(x=sel_dt, line=dict(color=MARKER, width=1, dash="dash"))
     return fig
 
@@ -229,7 +224,7 @@ def fig_nav(portfolio: pd.DataFrame, sel_dt) -> go.Figure:
         line=dict(color=NEUTRAL, width=2),
         hovertemplate="%{x|%Y-%m-%d}<br>净值 %{y:.4f}<extra></extra>",
     ))
-    fig.update_layout(**_base_layout("组合累计净值(起点 1)", 320, pct_y=False))
+    fig.update_layout(**_base_layout("组合累计净值(区间起点 1)", 320, pct_y=False))
     fig.add_hline(y=1, line=dict(color="#999999", width=1, dash="dot"))
     fig.add_vline(x=sel_dt, line=dict(color=MARKER, width=1, dash="dash"))
     return fig
@@ -259,11 +254,59 @@ def _pct_cell(v):
 
 def style_holdings(df: pd.DataFrame):
     """对已重命名为中文列名的表着色:红涨绿跌,百分比格式。"""
-    pct_cols = [c for c in df.columns if c in ("当日涨跌", "累计收益")]
+    pct_cols = [c for c in df.columns if c in ("当日收益率", "累计收益")]
     fmt = {c: "{:.2%}" for c in pct_cols}
-    if "评分" in df.columns:
-        fmt["评分"] = "{:.1f}"
+    if "仓位占比" in df.columns:
+        fmt["仓位占比"] = "{:.1%}"
     return df.style.map(_pct_cell, subset=pct_cols).format(fmt)
+
+
+# ====================== 日期导航(每日持仓/组合净值共用) ======================
+def _date_nav(prefix: str, dates: list[str], label: str) -> tuple[str, str, str]:
+    """开始/结束日期双输入框(对称布局)+ 滑块选日(仍可拖动)。
+
+    prefix 区分两个 tab 的控件 key;只影响展示范围,不影响回测。
+    返回 (选中日期, 开始日期, 结束日期),均为 'YYYY-MM-DD' 字符串。
+    """
+    ss = st.session_state
+    dset = set(dates)
+    first, last = dates[0], dates[-1]
+    sel_key = f"{prefix}_sel"
+    start_key = f"{prefix}_start"
+    end_key = f"{prefix}_end"
+
+    if sel_key not in ss or ss[sel_key] not in dset:
+        ss[sel_key] = last            # 首次/数据刷新后默认最后交易日
+    if start_key not in ss:
+        ss[start_key] = pd.Timestamp(first).date()
+    if end_key not in ss:
+        ss[end_key] = pd.Timestamp(last).date()
+
+    c0, c1 = st.columns(2)
+    with c0:
+        start_val = st.date_input("开始日期", min_value=pd.Timestamp(first).date(),
+                                  max_value=pd.Timestamp(last).date(),
+                                  format="YYYY-MM-DD", key=start_key)
+    with c1:
+        end_val = st.date_input("结束日期", min_value=pd.Timestamp(first).date(),
+                                max_value=pd.Timestamp(last).date(),
+                                format="YYYY-MM-DD", key=end_key)
+
+    start_str, end_str = str(start_val), str(end_val)
+    start_idx = next((i for i, d in enumerate(dates) if d >= start_str), len(dates) - 1)
+    end_idx = next((i for i, d in enumerate(dates) if d > end_str),
+                   len(dates)) - 1      # <= 结束日期的最后一个交易日
+    if end_idx < start_idx:
+        end_idx = start_idx             # 开始 > 结束:夹成同一天,避免滑块范围为空
+
+    # 范围变化后,选中日期被挤出则夹回边界
+    if ss[sel_key] > dates[end_idx]:
+        ss[sel_key] = dates[end_idx]
+    elif ss[sel_key] < dates[start_idx]:
+        ss[sel_key] = dates[start_idx]
+
+    sel = st.select_slider(label, options=dates[start_idx:end_idx + 1], key=sel_key)
+    return sel, start_str, end_str
 
 
 # ====================== 主流程 ======================
@@ -336,7 +379,7 @@ with st.sidebar:
                         if regime_data:
                             defense_recs = pd.DataFrame(
                                 regime_data["defense"],
-                                columns=["pos", "ts_code", "name", "start_date", "score"])
+                                columns=["pos", "ts_code", "name", "start_date"])
                             fetch_all = pd.concat([recs, defense_recs], ignore_index=True)
                         min_date = fetch_all["start_date"].min()
                         fetcher.ensure_trade_calendar(min_date,
@@ -382,7 +425,7 @@ elif recs is None:
 else:
     version = fetcher.get_data_version()
     db_key = str(DB_PATH)
-    recs_tuple = tuple(recs[["ts_code", "name", "start_date", "score"]]
+    recs_tuple = tuple(recs[["ts_code", "name", "start_date"]]
                        .itertuples(index=False, name=None))
     regime_key = None
     if regime_data:
@@ -404,44 +447,61 @@ else:
         if not dates:
             st.info("暂无数据")
         else:
-            sel_date = st.select_slider("选择日期(按日期展示当日持仓)",
-                                        options=dates, value=dates[-1])
+            sel_date, _, _ = _date_nav("d1", dates, "选择日期(展示当日交易与持仓)")
             day_df = daily_holdings[daily_holdings["date"] == sel_date]
             st.session_state.sel_date = sel_date
             st.session_state.sel_day_df = day_df
+            prow = portfolio[portfolio["date"] == sel_date].iloc[0]
+            m1, m2, m3 = st.columns(3)
+            m1.metric("当日账户收益率", f"{prow['account_return']:.2%}")
+            m2.metric("收盘持仓", f"{int(prow['n_stocks'])} 只")
+            m3.metric("当日费用", f"{prow['fee']:.4%}")
             if day_df.empty:
-                st.info(f"{sel_date} 当日无持仓")
+                st.info(f"{sel_date} 当日无交易、无持仓")
             else:
-                show = day_df[["name", "code", "rec_date", "entry_date", "score",
-                               "day_return", "cum_return", "trade_days"]].copy()
-                show = show.sort_values("cum_return", ascending=False, na_position="last")
-                show.columns = ["股票名称", "代码", "推荐日期", "买入日期", "评分",
-                                "当日涨跌", "累计收益", "交易天数"]
+                show = day_df[["name", "code", "action", "weight", "day_return",
+                               "cum_return", "rec_date", "entry_date", "trade_days"]].copy()
+                show["操作"] = show["action"].map({"buy": "买入", "sell": "卖出", "hold": "持有"})
+                show = show[["name", "code", "操作", "weight", "day_return", "cum_return",
+                             "rec_date", "entry_date", "trade_days"]]
+                show.columns = ["股票名称", "代码", "操作", "仓位占比", "当日收益率",
+                                "累计收益", "推荐日期", "买入日期", "交易天数"]
+                order = {"卖出": 0, "买入": 1, "持有": 2}
+                show = show.sort_values(
+                    ["操作", "累计收益"], ascending=[True, False], na_position="last",
+                    key=lambda s: s.map(order) if s.name == "操作" else s)
                 st.dataframe(style_holdings(show), width="stretch",
                              hide_index=True)
-                st.caption(f"共 {len(show)} 笔持仓(同股多轮推荐各算一笔) | 当日涨跌=全日涨跌幅,"
-                           f"买入日取实体涨幅(开盘→收盘);累计收益自买入日起复利")
+                st.caption(f"仓位占比 = 等权 1/收盘持仓数,卖出的股票计 0%;"
+                           f"当日收益率:卖出=开盘涨跌幅,当日新买=实体涨幅,持有=全天涨跌幅(收盘/昨收-1);"
+                           f"账户收益率 = (1+昨日持仓今日平均开盘涨跌幅)×(1+今日持仓平均实体涨幅)-1;"
+                           f"累计收益自买入日起复利(买入日实体涨幅、之后全日涨跌幅)")
 
     # ---------- Tab2 组合净值 ----------
     with tab2:
         if not dates:
             st.info("暂无数据")
         else:
-            sel_dt = st.select_slider("推进日期", options=dates, value=dates[-1],
-                                      key="nav_slider")
-            row = portfolio[portfolio["date"] == sel_dt].iloc[0]
+            sel_dt, start_str, end_str = _date_nav("d2", dates, "推进日期")
+            sel_dt_v = pd.to_datetime(sel_dt)
+            # 图表跟随起止日期;净值按区间重定基:开始日 = 1,回撤按区间内峰值重算
+            p_show = portfolio[(portfolio["date"] >= start_str)
+                               & (portfolio["date"] <= end_str)].copy()
+            if not p_show.empty and p_show["nav"].iloc[0]:
+                nav_rel = p_show["nav"] / p_show["nav"].iloc[0]
+                p_show["nav"] = nav_rel
+                p_show["drawdown"] = nav_rel / nav_rel.cummax() - 1
+            row = p_show[p_show["date"] == sel_dt].iloc[0]
             m1, m2, m3, m4, m5 = st.columns(5)
             m1.metric("净值", f"{row['nav']:.4f}")
-            m2.metric("当日收益",
-                      f"{row['avg_return']:.2%}" if row["avg_return"] is not None else "—")
+            m2.metric("当日收益", f"{row['account_return']:.2%}")
             m3.metric("回撤", f"{row['drawdown']:.2%}")
             m4.metric("持仓数", f"{int(row['n_stocks'])} 只")
             m5.metric("当日费用", f"{row['fee']:.4%}")
-            sel_dt_v = pd.to_datetime(sel_dt)
-            st.plotly_chart(fig_daily_returns(portfolio, sel_dt_v),
+            st.plotly_chart(fig_daily_returns(p_show, sel_dt_v),
                             width="stretch")
-            st.plotly_chart(fig_nav(portfolio, sel_dt_v), width="stretch")
-            st.plotly_chart(fig_drawdown(portfolio, sel_dt_v), width="stretch")
+            st.plotly_chart(fig_nav(p_show, sel_dt_v), width="stretch")
+            st.plotly_chart(fig_drawdown(p_show, sel_dt_v), width="stretch")
 
     # ---------- Tab3 回测明细 ----------
     with tab3:
@@ -451,7 +511,7 @@ else:
             show = summary.sort_values("cum_return", ascending=False,
                                        na_position="last").rename(columns={
                 "name": "股票名称", "code": "代码", "rec_date": "推荐日期",
-                "score": "评分", "entry_date": "买入日期", "last_date": "最后交易日",
+                "entry_date": "买入日期", "last_date": "最后交易日",
                 "n_trade_days": "交易天数", "cum_return": "累计收益",
                 "status": "状态"})
             st.dataframe(style_holdings(show), width="stretch", hide_index=True)
@@ -505,7 +565,8 @@ else:
                     path = _write_export(pd.DataFrame(), "回测报表")
                     with pd.ExcelWriter(path, engine="openpyxl") as writer:
                         summary.to_excel(writer, sheet_name="个股汇总", index=False)
-                        portfolio.to_excel(writer, sheet_name="每日组合", index=False)
+                        portfolio.drop(columns=["_dt"]).to_excel(
+                            writer, sheet_name="每日组合", index=False)
                         daily_holdings.to_excel(writer, sheet_name="每日持仓明细", index=False)
                     st.success(f"已导出:{path}")
                     st.download_button("下载", path.read_bytes(),

@@ -6,7 +6,7 @@
     - holdings: dict {ts_code: Holding},Holding 含 code/entry_date/weight/cum_return
     - bars:     dict {ts_code: bar},bar 为当日行情 dict(open/high/low/close/pre_close/pct_chg/vol)
                 当日无行情的股票(停牌等)不出现在 bars 里
-    - recs:     list[(pos, ts_code, name, start_date, score)],起始日期 <= date 的全部推荐,
+    - recs:     list[(pos, ts_code, name, start_date)],起始日期 <= date 的全部推荐,
                 引擎过滤好传入;pos 为推荐唯一键,每条推荐是独立交易(同股多条推荐各自成仓)
     - 返回当日要执行的买卖动作;引擎先执行卖出、再执行买入。
       op 三种:"buy"(开盘买)、"sell"(收盘卖,旧规则用)、"sell_open"(开盘卖,攻防规则用)
@@ -43,7 +43,7 @@ def make_hold_n_days(hold_days: int = 10):
         for pos in list(held_days):
             if pos not in holdings:       # 引擎已移除(卖出/停牌未买成)的,清掉计数
                 del held_days[pos]
-        for pos, _ts_code, _name, _start_date, _score in recs:
+        for pos, *_rest in recs:
             if pos not in holdings and pos not in sold:
                 actions.append(Action("buy", pos, None))
                 held_days[pos] = 1        # 买入日 = 第 1 个交易日
@@ -61,7 +61,7 @@ def make_regime_rule(regime, defense_recs, x, y, z):
     """攻防转换规则(完整口径见 RULES.md;参数在 config.py)。
 
     regime:       list[(start, end, position)],仓位区间,position 为"成"数(0~10)
-    defense_recs: list[(pos, ts_code, name, start_date, score)],防守列表(与引擎 recs 同构)
+    defense_recs: list[(pos, ts_code, name, start_date)],防守列表(与引擎 recs 同构)
     x:            仓位阈值,当日仓位 >= x → 进攻;仓位表未覆盖的日期按防守(保守)
     y / z:        进攻持有最近 y 条推荐 / 防守持有最近 z 条防守列表;同起始日期并列全部保留
 

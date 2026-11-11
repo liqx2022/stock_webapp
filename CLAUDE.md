@@ -26,12 +26,12 @@
 
 ## 规则契约
 
-规则函数签名:`decide(date, holdings, bars, recs) -> list[Action]`,`Action(op, pos, weight)`,`op ∈ {buy, sell, sell_open}`(买入均开盘价;sell=收盘卖,sell_open=开盘卖,开盘卖当日收益=开盘涨跌幅)。`recs` 条目为 `(pos, ts_code, name, start_date, score)`,`pos` 是推荐唯一键,每条推荐是独立交易。当前规则:攻防转换(完整口径见 RULES.md,参数在 config.py 策略参数区):仓位 ≥ x 进攻持最近 y 条推荐,否则防守持最近 z 条防守列表;调仓一律开盘价成交,同股新旧仓同日合并(保留最早进场旧仓、不开新仓);引擎 fee 参数计手续费(费率在 config.py)。规则带状态,app.py 每次回测新建实例;改规则只动 rules.py。
+规则函数签名:`decide(date, holdings, bars, recs) -> list[Action]`,`Action(op, pos, weight)`,`op ∈ {buy, sell, sell_open}`(买入均开盘价;sell=收盘卖,sell_open=开盘卖,开盘卖当日收益=开盘涨跌幅)。`recs` 条目为 `(pos, ts_code, name, start_date)`,`pos` 是推荐唯一键,每条推荐是独立交易。当前规则:攻防转换(完整口径见 RULES.md,参数在 config.py 策略参数区):仓位 ≥ x 进攻持最近 y 条推荐,否则防守持最近 z 条防守列表;调仓一律开盘价成交,同股新旧仓同日合并(保留最早进场旧仓、不开新仓);引擎 fee 参数计手续费(费率在 config.py)。规则带状态,app.py 每次回测新建实例;改规则只动 rules.py。
 
 ## 约定
 
 - 日期一律 `YYYY-MM-DD` 字符串;收益存小数(0.05 = 5%)
-- 口径(与旧脚本 `股票统计1_0628智能评分收益回测系统.py` 对齐):买入当日收益=实体涨幅(收盘/开盘-1),之后每日=pct_chg/100;停牌日收益 0;组合收益=持仓等权平均
+- 口径:个股累计收益=买入当日实体涨幅(收盘/开盘-1),之后每日=pct_chg/100,停牌日跳过;当日账户收益=(1+昨日持仓今日平均开盘涨跌幅)×(1+今日持仓平均实体涨幅)-1;持仓页当日收益率展示:卖出=开盘涨跌幅、当日新买=实体涨幅、持有=全天涨跌幅(收盘/昨收-1)(完整口径见 RULES.md)
 - 图表配色:红涨绿跌(中国股市惯例)
 - 行情表主键 ts_code+trade_date,写入用 INSERT OR REPLACE
 - 代码后缀:6→.SH,0/3→.SZ,5位→.HK;名称匹配先精确、后子串互含
@@ -41,9 +41,9 @@
 - 不引入 FastAPI/Flask/Docker/异步/ORM,保持单机简单
 - config.py、cache/、input/、output/ 不提交 git
 
-## 已知简化(v1)
+## 已知简化
 
-智能评分汇总行、万德全A基准对比未做;买入按开盘、卖出按收盘;同一天同股多条推荐会开成两笔相同持仓(各自独立计算)。
+万德全A基准对比未做;同一天同股多条推荐会开成两笔相同持仓(各自独立计算)。行为/口径变更按日期记在 CHANGELOG.md,策略口径细节以 RULES.md 为准。
 
 ## 常见问题
 
