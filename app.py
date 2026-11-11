@@ -168,10 +168,18 @@ def _load_trade_dates(db_key: str, version: int) -> list:
     return fetcher.load_trade_dates(db_key)
 
 
+def _engine_stamp() -> str:
+    """引擎源码 mtime 指纹:backtest/rules/indicators 代码一改,缓存 key 随之变化,
+    避免输入文件没变时页面继续用旧口径的回测结果(如改 bug 后买入日期仍旧值)。"""
+    root = Path(__file__).parent
+    return ";".join(f"{name}:{int((root / name).stat().st_mtime)}"
+                    for name in ("backtest.py", "rules.py", "indicators.py"))
+
+
 # 策略参数作为 _run_backtest 签名的一部分:参数值变化 → 缓存自动失效重算
 @st.cache_data(show_spinner=False)
 def _run_backtest(recs_tuple: tuple, regime_key, db_key: str, version: int,
-                  x: float, y: int, z: int, fee: dict):
+                  x: float, y: int, z: int, fee: dict, engine_ver: str = ""):
     recs = pd.DataFrame(list(recs_tuple),
                         columns=["ts_code", "name", "start_date"])
     market = _load_market(db_key, version)
@@ -262,21 +270,61 @@ def style_holdings(df: pd.DataFrame):
 
 
 # ====================== 日期导航(每日持仓/组合净值共用) ======================
-def _date_nav(prefix: str, dates: list[str], label: str) -> tuple[str, str, str]:
-    """开始/结束日期双输入框(对称布局)+ 滑块选日(仍可拖动)。
+def _nearest_trade_date(dates: list[str], d: str) -> str:
+    """把任意日历日期就近对齐到交易日(两侧距离相等取较早的一天),超范围夹到边界。"""
+    if d <= dates[0]:
+        return dates[0]
+    if d >= dates[-1]:
+        return dates[-1]
+    idx = next((i for i, x in enumerate(dates) if x >= d), len(dates) - 1)
+    if dates[idx] == d:
+        return d
+    if idx == 0:
+        return dates[0]
+    before, after = dates[idx - 1], dates[idx]
+    t = pd.Timestamp(d)
+    return before if (t - pd.Timestamp(before)) <= (pd.Timestamp(after) - t) else after
 
-    prefix 区分两个 tab 的控件 key;只影响展示范围,不影响回测。
+
+def _date_nav(prefix: str, dates: list[str], label: str,
+              with_end: bool = True) -> tuple[str, str, str]:
+    """日期选择控件 + 滑块。
+
+    with_end=False(每日持仓):单个「日期」卡片即所选日期,与滑块双向同步——
+      改卡片 → 滑块/持仓跟随(非交易日就近对齐到交易日);拖滑块 → 卡片跟随。
+    with_end=True(组合净值):开始/结束日期定义展示区间,滑块在区间内选日,
+      图表随区间截取,净值按区间重定基。
+    prefix 区分两个 tab 的控件 key;只影响展示,不影响回测。
     返回 (选中日期, 开始日期, 结束日期),均为 'YYYY-MM-DD' 字符串。
     """
     ss = st.session_state
     dset = set(dates)
     first, last = dates[0], dates[-1]
     sel_key = f"{prefix}_sel"
-    start_key = f"{prefix}_start"
-    end_key = f"{prefix}_end"
 
     if sel_key not in ss or ss[sel_key] not in dset:
         ss[sel_key] = last            # 首次/数据刷新后默认最后交易日
+
+    if not with_end:
+        # 每日持仓:卡片与滑块选同一天,on_change 回调在下一次运行前触发,实现双向同步
+        date_key = f"{prefix}_date"
+        if date_key not in ss:
+            ss[date_key] = pd.Timestamp(last).date()
+
+        def _on_card():
+            ss[sel_key] = _nearest_trade_date(dates, ss[date_key].isoformat())
+
+        def _on_slider():
+            ss[date_key] = pd.Timestamp(ss[sel_key]).date()
+
+        date_val = st.date_input("日期", min_value=pd.Timestamp(first).date(),
+                                 max_value=pd.Timestamp(last).date(),
+                                 format="YYYY-MM-DD", key=date_key, on_change=_on_card)
+        sel = st.select_slider(label, options=dates, key=sel_key, on_change=_on_slider)
+        return sel, str(date_val), last
+
+    start_key = f"{prefix}_start"
+    end_key = f"{prefix}_end"
     if start_key not in ss:
         ss[start_key] = pd.Timestamp(first).date()
     if end_key not in ss:
@@ -432,7 +480,8 @@ else:
         regime_key = (tuple(regime_data["regime"]), tuple(regime_data["defense"]))
     x_th, y_off, z_def, fee = _strategy_params()
     daily_holdings, portfolio, summary = _run_backtest(
-        recs_tuple, regime_key, db_key, version, x_th, y_off, z_def, fee)
+        recs_tuple, regime_key, db_key, version, x_th, y_off, z_def, fee,
+        engine_ver=_engine_stamp())
 
     if portfolio.empty:
         st.info("数据库中还没有行情数据。点击侧边栏「初始化/更新行情数据」按钮。")
@@ -447,7 +496,8 @@ else:
         if not dates:
             st.info("暂无数据")
         else:
-            sel_date, _, _ = _date_nav("d1", dates, "选择日期(展示当日交易与持仓)")
+            sel_date, _, _ = _date_nav("d1", dates, "选择日期(展示当日交易与持仓)",
+                                       with_end=False)
             day_df = daily_holdings[daily_holdings["date"] == sel_date]
             st.session_state.sel_date = sel_date
             st.session_state.sel_day_df = day_df
