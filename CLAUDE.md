@@ -13,7 +13,7 @@
 
 | 文件 | 职责 |
 |---|---|
-| app.py | Streamlit 页面(唯一入口):上传 Excel、更新行情、四个 tab(每日持仓/组合净值/回测明细/导出) |
+| app.py | Streamlit 页面(唯一入口):上传 Excel、更新行情、五个 tab(每日持仓/组合净值/回测明细/导出/交易计划) |
 | data_fetcher.py | tushare 全部交互、SQLite 建表与读写、增量更新(只拉缺口) |
 | backtest.py | 回测引擎:推荐记录 + 行情 + 规则 → 每日持仓/组合净值/个股汇总 |
 | rules.py | 买卖规则(可插拔)。**改规则只动本文件,不要改 backtest.py** |

@@ -61,7 +61,7 @@ def run_backtest(recs: pd.DataFrame, market: pd.DataFrame, trade_dates: list[str
     if min_rec is None or max_data is None:
         return (pd.DataFrame(columns=["date", "code", "name", "action", "rec_date",
                                       "entry_date", "weight", "day_return", "cum_return",
-                                      "trade_days"]),
+                                      "trade_days", "pos"]),
                 pd.DataFrame(columns=["date", "n_stocks", "account_return", "fee", "nav",
                                       "drawdown"]),
                 pd.DataFrame(columns=["code", "name", "rec_date", "entry_date",
@@ -250,7 +250,7 @@ def run_backtest(recs: pd.DataFrame, market: pd.DataFrame, trade_dates: list[str
     daily_holdings = pd.DataFrame(holding_rows,
                                   columns=["date", "code", "name", "action", "rec_date",
                                            "entry_date", "weight", "day_return", "cum_return",
-                                           "trade_days"])
+                                           "trade_days", "pos"])
     portfolio_daily = pd.DataFrame(portfolio_rows)
     rec_summary = pd.DataFrame(rec_summary_rows)
     return daily_holdings, portfolio_daily, rec_summary
@@ -263,5 +263,5 @@ def _hold_row(date, pos, h, entry_info, weight, day_return, trade_days, action):
         "rec_date": rec_date, "entry_date": entry_date,
         "weight": weight,
         "day_return": day_return, "cum_return": h.cum_return,
-        "trade_days": trade_days,
+        "trade_days": trade_days, "pos": pos,
     }

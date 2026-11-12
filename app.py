@@ -2,7 +2,7 @@ r"""股票推荐回测 Web 应用(Streamlit 唯一入口)。
 
 运行: .venv\Scripts\python.exe -m streamlit run app.py
 """
-from datetime import datetime
+from datetime import datetime, timedelta
 import importlib
 from pathlib import Path
 
@@ -16,7 +16,7 @@ import backtest
 from config import (TS_TOKEN, DB_PATH, INPUT_DIR, OUTPUT_DIR, EXCEL_COLUMNS,
                     REGIME_FILE_NAME, DEFAULT_INPUT_FILE, BENCHMARKS, BENCHMARK_COMBO)
 from indicators import benchmark_navs
-from rules import make_hold_n_days, make_regime_rule
+from rules import make_hold_n_days, make_regime_rule, target_keys
 
 st.set_page_config(page_title="股票推荐回测", layout="wide",
                    initial_sidebar_state="expanded")
@@ -422,6 +422,82 @@ fetcher.init_db()
 st.title("📊 股票推荐回测")
 
 # ---------- 侧边栏 ----------
+def _trade_plan(plan_date: str, last_closed: str, recs: pd.DataFrame,
+                regime_data: dict, daily_holdings: pd.DataFrame,
+                x: float, y: int, z: int) -> dict:
+    """下一交易日计划:攻防规则在计划日的目标持仓 vs 最新收盘持仓的差分。
+
+    与回测完全同源:仓位判定/最近 y/z 条窗口(rules.target_keys)/同股卖旧买新
+    合并保留最早进场仓,口径见 RULES.md。返回 dict:
+    pos/inherited/offense/target/cur_date/sell/buy/hold/notes
+    (sell/buy/hold 为 pos 集合;lookup 元组 (pos, ts_code, name, start_date))
+    """
+    def _pos_of(d):
+        for s, e, p in regime_data["regime"]:
+            if s <= d <= e:
+                return p
+        return None
+    pos_plan = _pos_of(plan_date)
+    inherited = pos_plan is None
+    if inherited:
+        pos_plan = _pos_of(last_closed)
+    offense = pos_plan is not None and pos_plan >= x
+
+    base = len(recs)
+    offense_recs = [(int(i), r.ts_code, r.name, r.start_date)
+                    for i, r in enumerate(recs.itertuples())
+                    if r.start_date <= plan_date]
+    defense_recs_p = [(base + i, ts, n, sd)
+                      for i, (_pid, ts, n, sd) in enumerate(regime_data["defense"])]
+    defense_pos_p = {p for p, *_ in defense_recs_p}
+    if offense:
+        target_pool = [r for r in offense_recs if r[0] not in defense_pos_p]
+        target = target_keys(target_pool, y)
+    else:
+        target = target_keys(defense_recs_p, z)
+    lookup = {r[0]: r for r in offense_recs + defense_recs_p}
+
+    # 当前持仓:最近一个回测日的收盘持仓(卖出行除外)
+    cur_date = daily_holdings["date"].max()
+    cur_rows = daily_holdings[daily_holdings["date"] == cur_date]
+    cur = {int(r["pos"]): {"ts_code": r["code"], "name": r["name"],
+                           "entry_date": r["entry_date"],
+                           "rec_date": r["rec_date"]}
+           for _, r in cur_rows[cur_rows["action"] != "sell"].iterrows()}
+    cur = {p: info for p, info in cur.items() if p in lookup}
+
+    sell_pos = {p for p in cur if p not in target}
+    buy_pos = {p for p in target if p not in cur}
+    hold_pos = {p for p in target if p in cur}
+    # 同股"卖旧+买新"合并:保留最早进场旧仓(与规则口径一致)
+    buy_codes = {p: lookup[p][1] for p in buy_pos}
+    merged_codes = {cur[p]["ts_code"] for p in sell_pos} \
+        & set(c for c in buy_codes.values() if c)
+    for c in merged_codes:
+        olds = sorted((p for p in sell_pos if cur[p]["ts_code"] == c),
+                      key=lambda p: (cur[p]["entry_date"] or "", p))
+        keep = olds[0]
+        sell_pos.discard(keep)
+        hold_pos.add(keep)
+        buy_pos = {p for p in buy_pos if buy_codes[p] != c}
+
+    notes = []
+    if inherited and pos_plan is not None:
+        notes.append(f"计划日仓位表未覆盖,继承 {last_closed} 的仓位 {pos_plan:.1f} 成")
+    if inherited and pos_plan is None:
+        notes.append(f"计划日与上一交易日({last_closed})仓位表均未覆盖,"
+                     f"按防守处理(与回测引擎的保守口径一致);请在仓位 sheet 补充区间")
+    if cur_date < last_closed:
+        notes.append(f"最新行情只到 {cur_date},当前持仓按该日收盘计算"
+                     f"(点「初始化/更新行情数据」刷新)")
+    if offense and not target_pool:
+        notes.append("进攻但尚无起始日期 ≤ 计划日的推荐,空仓等待")
+    return {"pos": pos_plan, "inherited": inherited, "offense": offense,
+            "target": target, "cur_date": cur_date, "lookup": lookup,
+            "cur": cur, "sell": sell_pos, "buy": buy_pos, "hold": hold_pos,
+            "notes": notes}
+
+
 def parse_into_state(path):
     """按文件修改时间缓存解析结果,避免每次交互都重读 Excel。"""
     mkey = f"{path.name}:{path.stat().st_mtime_ns}"
@@ -548,7 +624,7 @@ else:
     if portfolio.empty:
         st.info("数据库中还没有行情数据。点击侧边栏「初始化/更新行情数据」按钮。")
 
-    tab1, tab2, tab3, tab4 = st.tabs(["每日持仓", "组合净值", "回测明细", "导出"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["每日持仓", "组合净值", "回测明细",
                                             "导出", "交易计划"])
 
     dates = portfolio["date"].tolist() if not portfolio.empty else []
@@ -717,3 +793,74 @@ else:
                                        file_name=path.name)
                 else:
                     st.info("暂无数据可导出")
+
+    # ---------- Tab5 交易计划 ----------
+    with tab5:
+        if regime_data is None or recs is None or recs.empty:
+            st.info("需要仓位/防守文件与推荐数据,先在侧边栏选择输入 Excel")
+        else:
+            # 1. 计划日期 = 最后一个已收盘交易日(15:00)的下一交易日;日历补拉未来两周
+            now = datetime.now()
+            today = now.strftime("%Y-%m-%d")
+            try:
+                fetcher.ensure_trade_calendar(
+                    recs["start_date"].min(),
+                    (now + timedelta(days=14)).strftime("%Y-%m-%d"))
+            except Exception:
+                pass  # 日历补拉失败时先用库里已有的日历,缺未来日期则下方提示
+            tds_all = fetcher.load_trade_dates()   # 直查 DB(含未来日期),不走缓存
+            closed = [d for d in tds_all if d < today]
+            if today in tds_all and now.hour >= 15:
+                closed.append(today)               # 今天已过 15:00 收盘
+            last_closed = max(closed) if closed else None
+            after = [d for d in tds_all if last_closed and d > last_closed]
+            plan_date = after[0] if after else None
+            if plan_date is None:
+                st.info("交易日历未覆盖下一交易日,点侧边栏「初始化/更新行情数据」补拉日历后重试")
+            else:
+                plan = _trade_plan(plan_date, last_closed, recs, regime_data,
+                                   daily_holdings, x_th, y_off, z_def)
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("计划日期", plan_date)
+                m2.metric("攻防状态", "进攻" if plan["offense"] else "防守")
+                m3.metric("仓位", f"{plan['pos']:.1f} 成" if plan["pos"] is not None
+                          else "仓位表未覆盖")
+                m4.metric("目标持仓", f"{len(plan['target'])} 只")
+                for s in plan["notes"]:
+                    st.warning(s)
+
+                rows = []
+                for p in plan["sell"]:
+                    src = plan["cur"][p]
+                    rows.append({"操作": "卖出(被替换)", "名称": src["name"],
+                                 "代码": src["ts_code"],
+                                 "推荐日期": src["rec_date"],
+                                 "买入日期": src["entry_date"]})
+                for p in plan["buy"]:
+                    r = plan["lookup"][p]
+                    rows.append({"操作": "买入(新增)", "名称": r[2], "代码": r[1],
+                                 "推荐日期": r[3], "买入日期": plan_date + "(计划)"})
+                for p in plan["hold"]:
+                    src = plan["cur"][p]
+                    rows.append({"操作": "持有", "名称": src["name"],
+                                 "代码": src["ts_code"], "推荐日期": src["rec_date"],
+                                 "买入日期": src["entry_date"]})
+                plan_df = pd.DataFrame(rows)
+                if plan_df.empty:
+                    st.info(f"{plan_date} 无持仓计划(空仓)")
+                else:
+                    order = {"卖出(被替换)": 0, "买入(新增)": 1, "持有": 2}
+                    plan_df = plan_df.sort_values(
+                        "操作", key=lambda s: s.map(order)).reset_index(drop=True)
+                    st.dataframe(plan_df, width="stretch", hide_index=True)
+                _gap_note = (f"开盘涨幅过滤:新买入股票当日开盘涨幅(开盘/昨收-1)超 "
+                             f"{gap_skip:.0%} 时实盘会直接舍弃该推荐(视同无此股票,"
+                             "永不买入)、由后续推荐补位,计划表无法预知次日开盘价,"
+                             "以实际成交为准"
+                             if gap_skip is not None
+                             else "开盘涨幅过滤:未启用(OPEN_GAP_SKIP = None)")
+                st.caption("计划 = 攻防规则在计划日的目标持仓与最新收盘持仓的差分:"
+                           "新增推荐买入、跌出最近 y/z 条窗口的旧仓卖出(替换最旧的优先),"
+                           "其余持有;同股卖旧买新合并保留最早进场仓。"
+                           "实际成交按次日开盘价,停牌顺延;每日 15:00 收盘后计划自动切到下一交易日。"
+                           "决策依据与回测完全同源(rules.target_keys 共用)。" + _gap_note)
