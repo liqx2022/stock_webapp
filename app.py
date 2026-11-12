@@ -16,7 +16,7 @@ import backtest
 from config import (TS_TOKEN, DB_PATH, INPUT_DIR, OUTPUT_DIR, EXCEL_COLUMNS,
                     REGIME_FILE_NAME, DEFAULT_INPUT_FILE, BENCHMARKS, BENCHMARK_COMBO)
 from indicators import benchmark_navs
-from rules import make_hold_n_days, make_regime_rule, target_keys
+from rules import make_hold_n_days, make_regime_rule, prev_gain_discard, target_keys
 
 st.set_page_config(page_title="股票推荐回测", layout="wide",
                    initial_sidebar_state="expanded")
@@ -140,7 +140,8 @@ def _strategy_params():
     """
     importlib.reload(config)
     return (config.X_THRESHOLD, config.Y_OFFENSE, config.Z_DEFENSE,
-            config.FEE, config.OPEN_GAP_SKIP)
+            config.FEE, config.OPEN_GAP_SKIP, config.PREV_DAY_GAIN_SKIP,
+            config.MAX_PER_DAY, config.LIMIT_UP_SKIP)
 
 
 _CONFIG_PATH = Path(config.__file__)
@@ -172,6 +173,12 @@ def _load_trade_dates(db_key: str, version: int) -> list:
 
 
 @st.cache_data(show_spinner=False)
+def _bars_by_date(db_key: str, version: int) -> dict:
+    """{date: {ts_code: bar}} 形式的行情(交易计划页前收涨幅过滤用,带缓存)。"""
+    return backtest._build_bars_by_date(_load_market(db_key, version))
+
+
+@st.cache_data(show_spinner=False)
 def _ensure_benchmarks(db_key: str, bench_ver: int, start: str, codes: tuple) -> dict:
     """基准数据缺口自动补拉(按 bench_version/区间起点缓存,缺什么补什么)。"""
     return fetcher.ensure_benchmarks(list(codes), start)
@@ -192,7 +199,8 @@ def _engine_stamp() -> str:
 
 # 策略参数作为 _run_backtest 签名的一部分:参数值变化 → 缓存自动失效重算
 def _build_rule_and_recs(recs_tuple: tuple, regime_key, x: float, y: int, z: int,
-                         gap: float | None = None):
+                         gap: float | None = None, prev_gain: float | None = None,
+                         mpd: int | None = None, limit_fill: bool = False):
     """推荐元组 + 仓位/防守状态 → (并入防守行的 recs_all, 规则实例)。每次调用新建规则。"""
     recs = pd.DataFrame(list(recs_tuple),
                         columns=["ts_code", "name", "start_date"])
@@ -207,7 +215,8 @@ def _build_rule_and_recs(recs_tuple: tuple, regime_key, x: float, y: int, z: int
         [recs, pd.DataFrame([d[1:] for d in defense_rows],
                             columns=["ts_code", "name", "start_date"])],
         ignore_index=True)
-    return recs_all, make_regime_rule(list(regime), defense_rows, x, y, z, gap)
+    return recs_all, make_regime_rule(list(regime), defense_rows, x, y, z, gap,
+                                      prev_gain, mpd, limit_fill)
 
 
 def _run_engine(recs_all, rule, db_key: str, version: int, fee: dict):
@@ -218,20 +227,25 @@ def _run_engine(recs_all, rule, db_key: str, version: int, fee: dict):
 
 @st.cache_data(show_spinner=False)
 def _run_backtest(recs_tuple: tuple, regime_key, db_key: str, version: int,
-                  x: float, y: int, z: int, gap: float | None, fee: dict,
-                  engine_ver: str = ""):
-    recs_all, rule = _build_rule_and_recs(recs_tuple, regime_key, x, y, z, gap)
+                  x: float, y: int, z: int, gap: float | None,
+                  prev_gain: float | None, mpd: int | None, limit_fill: bool,
+                  fee: dict, engine_ver: str = ""):
+    recs_all, rule = _build_rule_and_recs(recs_tuple, regime_key, x, y, z, gap,
+                                          prev_gain, mpd, limit_fill)
     return _run_engine(recs_all, rule, db_key, version, fee)
 
 
 @st.cache_data(show_spinner=False)
 def _run_backtest_x0(recs_tuple: tuple, regime_key, db_key: str, version: int,
-                     y: int, z: int, gap: float | None, fee: dict,
+                     y: int, z: int, gap: float | None, prev_gain: float | None,
+                     mpd: int | None, limit_fill: bool, fee: dict,
                      engine_ver: str = ""):
     """单押对比组合:X_THRESHOLD=0 的同规则回测(仓位表覆盖到的交易日永远进攻,
-    持最近 y 条推荐;未覆盖日仍按防守兜底)。其余口径(开盘涨幅过滤/费率/停牌
-    顺延/等权满仓)与主回测一致,仅用于净值对比展示。"""
-    recs_all, rule = _build_rule_and_recs(recs_tuple, regime_key, 0.0, y, z, gap)
+    持最近 y 条推荐;未覆盖日仍按防守兜底)。其余口径(开盘涨幅/前收涨幅过滤/
+    单日上限/涨跌停可成交性/费率/停牌顺延/等权满仓)与主回测一致,仅用于净值
+    对比展示。"""
+    recs_all, rule = _build_rule_and_recs(recs_tuple, regime_key, 0.0, y, z, gap,
+                                          prev_gain, mpd, limit_fill)
     _, portfolio, _ = _run_engine(recs_all, rule, db_key, version, fee)
     return portfolio
 
@@ -424,11 +438,13 @@ st.title("📊 股票推荐回测")
 # ---------- 侧边栏 ----------
 def _trade_plan(plan_date: str, last_closed: str, recs: pd.DataFrame,
                 regime_data: dict, daily_holdings: pd.DataFrame,
-                x: float, y: int, z: int) -> dict:
+                x: float, y: int, z: int, bars_by_date: dict,
+                prev_gain: float | None, max_per_day: int | None = None) -> dict:
     """下一交易日计划:攻防规则在计划日的目标持仓 vs 最新收盘持仓的差分。
 
     与回测完全同源:仓位判定/最近 y/z 条窗口(rules.target_keys)/同股卖旧买新
-    合并保留最早进场仓,口径见 RULES.md。返回 dict:
+    合并保留最早进场仓/前收涨幅剔除(rules.prev_gain_discard 共用),口径见
+    RULES.md。返回 dict:
     pos/inherited/offense/target/cur_date/sell/buy/hold/notes
     (sell/buy/hold 为 pos 集合;lookup 元组 (pos, ts_code, name, start_date))
     """
@@ -450,11 +466,15 @@ def _trade_plan(plan_date: str, last_closed: str, recs: pd.DataFrame,
     defense_recs_p = [(base + i, ts, n, sd)
                       for i, (_pid, ts, n, sd) in enumerate(regime_data["defense"])]
     defense_pos_p = {p for p, *_ in defense_recs_p}
+    # 前收涨幅过滤与回测同口径:开始日期前一交易日收盘涨幅超阈值的推荐已永久舍弃
+    dropped = prev_gain_discard(offense_recs + defense_recs_p, bars_by_date, prev_gain)
     if offense:
-        target_pool = [r for r in offense_recs if r[0] not in defense_pos_p]
-        target = target_keys(target_pool, y)
+        target_pool = [r for r in offense_recs if r[0] not in defense_pos_p
+                       and r[0] not in dropped]
+        target = target_keys(target_pool, y, max_per_day)
     else:
-        target = target_keys(defense_recs_p, z)
+        target = target_keys([r for r in defense_recs_p if r[0] not in dropped],
+                             z, max_per_day)
     lookup = {r[0]: r for r in offense_recs + defense_recs_p}
 
     # 当前持仓:最近一个回测日的收盘持仓(卖出行除外)
@@ -616,10 +636,10 @@ else:
     regime_key = None
     if regime_data:
         regime_key = (tuple(regime_data["regime"]), tuple(regime_data["defense"]))
-    x_th, y_off, z_def, fee, gap_skip = _strategy_params()
+    x_th, y_off, z_def, fee, gap_skip, prev_skip, mpd, limit_fill = _strategy_params()
     daily_holdings, portfolio, summary = _run_backtest(
-        recs_tuple, regime_key, db_key, version, x_th, y_off, z_def, gap_skip, fee,
-        engine_ver=_engine_stamp())
+        recs_tuple, regime_key, db_key, version, x_th, y_off, z_def, gap_skip,
+        prev_skip, mpd, limit_fill, fee, engine_ver=_engine_stamp())
 
     if portfolio.empty:
         st.info("数据库中还没有行情数据。点击侧边栏「初始化/更新行情数据」按钮。")
@@ -686,7 +706,8 @@ else:
             if regime_key is not None:
                 try:
                     dan_pf = _run_backtest_x0(recs_tuple, regime_key, db_key, version,
-                                              y_off, z_def, gap_skip, fee,
+                                              y_off, z_def, gap_skip, prev_skip, mpd,
+                                              limit_fill, fee,
                                               engine_ver=_engine_stamp())
                     dan_show = dan_pf[(dan_pf["date"] >= start_str)
                                       & (dan_pf["date"] <= end_str)]
@@ -819,7 +840,8 @@ else:
                 st.info("交易日历未覆盖下一交易日,点侧边栏「初始化/更新行情数据」补拉日历后重试")
             else:
                 plan = _trade_plan(plan_date, last_closed, recs, regime_data,
-                                   daily_holdings, x_th, y_off, z_def)
+                                   daily_holdings, x_th, y_off, z_def,
+                                   _bars_by_date(db_key, version), prev_skip, mpd)
                 m1, m2, m3, m4 = st.columns(4)
                 m1.metric("计划日期", plan_date)
                 m2.metric("攻防状态", "进攻" if plan["offense"] else "防守")
@@ -859,8 +881,21 @@ else:
                              "以实际成交为准"
                              if gap_skip is not None
                              else "开盘涨幅过滤:未启用(OPEN_GAP_SKIP = None)")
+                _pgain_note = (f"前收涨幅过滤:推荐前一交易日收盘涨幅超 {prev_skip:.0%} "
+                               "的已从目标池剔除(与回测口径一致)"
+                               if prev_skip is not None
+                               else "前收涨幅过滤:未启用(PREV_DAY_GAIN_SKIP = None)")
+                _mpd_note = (f"单日上限:同一推荐日至多 {mpd} 条进窗口(MAX_PER_DAY)"
+                             if mpd is not None
+                             else "单日上限:未启用(MAX_PER_DAY = None,同日并列全保留)")
+                _limit_note = ("涨跌停可成交性:开盘即涨停的新买推荐实盘挂单大概率不成,"
+                               "回测按舍弃处理;开盘跌停的持仓当日卖不出、顺延"
+                               "(LIMIT_UP_SKIP)" if limit_fill else
+                               "涨跌停可成交性:未启用(LIMIT_UP_SKIP = False)")
                 st.caption("计划 = 攻防规则在计划日的目标持仓与最新收盘持仓的差分:"
                            "新增推荐买入、跌出最近 y/z 条窗口的旧仓卖出(替换最旧的优先),"
                            "其余持有;同股卖旧买新合并保留最早进场仓。"
                            "实际成交按次日开盘价,停牌顺延;每日 15:00 收盘后计划自动切到下一交易日。"
-                           "决策依据与回测完全同源(rules.target_keys 共用)。" + _gap_note)
+                           "决策依据与回测完全同源(rules.target_keys 共用)。"
+                           + _mpd_note + "。" + _limit_note + "。" + _pgain_note + "。"
+                           + _gap_note)

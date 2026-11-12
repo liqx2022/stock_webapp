@@ -18,7 +18,7 @@
 """
 from collections import namedtuple
 
-from indicators import gap_return
+from indicators import daily_return, gap_return
 
 Action = namedtuple("Action", ["op", "pos", "weight"])
 # op: "buy" | "sell";pos 为推荐唯一键(recs 里的 pos,引擎按它定位持仓);
@@ -27,17 +27,33 @@ Action = namedtuple("Action", ["op", "pos", "weight"])
 Holding = namedtuple("Holding", ["code", "entry_date", "weight", "cum_return"])
 
 
-def target_keys(recs, k):
+def target_keys(recs, k, max_per_day=None):
     """最近 k 条:起始日期降序,截到第 k 条;与第 k 条同日期的全部保留。
 
     recs 条目 (pos, ts_code, name, start_date)。攻防规则与交易计划页共用,
     改这里两边同时生效。
+
+    max_per_day(单日上限,config.py MAX_PER_DAY)非 None 时改为"分散取窗":
+    从新到旧扫,每个起始日期至多取 c 条(同日按输入文件行序取前 c 条),
+    取满 k 条为止——同时消除"同日并列全保留"导致的窗口膨胀(日均 3 条推荐
+    下 y=5 实际持 10~18 只)与单日题材押注聚集;None 关闭,维持原口径
+    (与第 k 条同日并列的全部保留,持仓数可超 k)。
     """
     if not recs or k <= 0:
         return set()
     ordered = sorted(recs, key=lambda r: r[3], reverse=True)
-    cutoff = ordered[min(k, len(ordered)) - 1][3]
-    return {r[0] for r in ordered if r[3] >= cutoff}
+    if max_per_day is None:
+        cutoff = ordered[min(k, len(ordered)) - 1][3]
+        return {r[0] for r in ordered if r[3] >= cutoff}
+    picked, per_date = [], {}
+    for r in ordered:
+        if len(picked) >= k:
+            break
+        if per_date.get(r[3], 0) >= max_per_day:
+            continue
+        per_date[r[3]] = per_date.get(r[3], 0) + 1
+        picked.append(r[0])
+    return set(picked)
 
 
 def make_hold_n_days(hold_days: int = 10):
@@ -72,7 +88,77 @@ def make_hold_n_days(hold_days: int = 10):
     return rule
 
 
-def make_regime_rule(regime, defense_recs, x, y, z, max_open_gap=None):
+def prev_gain_discard(recs, bars_by_date, threshold):
+    """前收涨幅过滤:推荐「开始日期的前一交易日」收盘涨幅(pct_chg/100)>
+    threshold 的 pos 集合,按永久舍弃口径处理(视同无此推荐,永不买入)。
+
+    recs 条目 (pos, ts_code, name, start_date);bars_by_date 为
+    {date: {ts_code: bar}}(backtest._build_bars_by_date 的产物)。
+    涨幅在推荐日之前就已确定,判定与推荐何时进入窗口无关;
+    前一交易日无行情(停牌/上市首日/行情区间未覆盖)的推荐无法判定,不舍弃;
+    threshold 为 None 返回空集。交易计划页与本函数共用,保证两边口径一致。
+    """
+    out = set()
+    if threshold is None or not recs or not bars_by_date:
+        return out
+    dates = sorted(bars_by_date)
+    idx = {d: i for i, d in enumerate(dates)}
+    for pos, ts_code, _name, sd in recs:
+        i = idx.get(sd)
+        if not i:               # 0 = 推荐日是行情首日(无前一日);None = 行情无该日
+            continue
+        bar = bars_by_date[dates[i - 1]].get(ts_code)
+        prev = daily_return(bar.get("pct_chg")) if bar else None
+        if prev is not None and prev > threshold:
+            out.add(pos)
+    return out
+
+
+def limit_ratio(ts_code: str) -> float | None:
+    """按板块返回涨跌停幅度,None = 无涨跌幅限制(港股)。
+
+    近似口径:主板 10%、创业板(30)/科创板(68)/科创ETF(588) 20%、北交所 30%。
+    不区分新股上市首日等特殊安排(主板首日 44%、创业/科创首五日无限制)——
+    极端高开本就难以成交,近似偏向保守(详见 RULES.md)。
+    """
+    if ts_code.endswith(".HK"):
+        return None
+    sym = ts_code.split(".")[0]
+    if ts_code.endswith(".BJ"):
+        return 0.30
+    if sym.startswith(("30", "68", "588")):
+        return 0.20
+    return 0.10
+
+
+def _at_limit_price(ts_code, open_, pre_close, up: bool) -> bool:
+    """开盘价是否达到涨停(up=True)/跌停价。涨停价 = round(昨收×(1±幅度), 2)。
+
+    open_/pre_close 缺失或无法计算时返回 False(按可成交处理,交由停牌顺延逻辑)。
+    """
+    lim = limit_ratio(ts_code)
+    if lim is None or open_ is None or pre_close is None or not pre_close:
+        return False
+    try:
+        factor = (1 + lim) if up else (1 - lim)
+        limit_px = round(float(pre_close) * factor, 2)
+        return float(open_) >= limit_px - 1e-6 if up else float(open_) <= limit_px + 1e-6
+    except (TypeError, ValueError):
+        return False
+
+
+def open_at_limit_up(ts_code, open_, pre_close) -> bool:
+    """开盘即涨停(实盘挂单大概率买不进)。"""
+    return _at_limit_price(ts_code, open_, pre_close, up=True)
+
+
+def open_at_limit_down(ts_code, open_, pre_close) -> bool:
+    """开盘即跌停(实盘挂单大概率卖不出)。"""
+    return _at_limit_price(ts_code, open_, pre_close, up=False)
+
+
+def make_regime_rule(regime, defense_recs, x, y, z, max_open_gap=None,
+                     prev_gain_skip=None, max_per_day=None, limit_fill_skip=False):
     """攻防转换规则(完整口径见 RULES.md;参数在 config.py)。
 
     regime:       list[(start, end, position)],仓位区间,position 为"成"数(0~10)
@@ -84,6 +170,19 @@ def make_regime_rule(regime, defense_recs, x, y, z, max_open_gap=None):
                   阈值 → 永久舍弃(视同无此推荐,之后任何日期都不再买入),
                   空出的坑由排序靠后的推荐即时补位(补位者同日同样过检);
                   None 关闭;进攻/防守列表同口径
+    prev_gain_skip: 前收涨幅过滤阈值(config.py PREV_DAY_GAIN_SKIP):推荐开始日期
+                  的前一交易日收盘涨幅(pct_chg/100)> 阈值 → 永久舍弃;None 关闭。
+                  涨幅在推荐日前已确定,推荐日当天一次性判定;与 prev_gain_discard
+                  同口径(该函数供交易计划页在计划时即剔除,两者必须一致)
+    max_per_day:   单日上限(config.py MAX_PER_DAY):窗口内同一推荐日至多 c 条
+                  (同日按输入行序取前 c),取满 y/z 条为止;None 关闭(同日并列
+                  全保留)。详见 target_keys。防御非法配置:非 None 且 < 1 直接抛错
+    limit_fill_skip: 涨跌停可成交性(config.py LIMIT_UP_SKIP,默认 True):买入侧,
+                  推荐首次将被买入的当天开盘已达涨停价 → 实盘买不进,永久舍弃
+                  (同开盘涨幅过滤口径,由后续推荐补位);卖出侧对称处理,开盘
+                  已达跌停价的持仓当日不卖、顺延到下一交易日开盘(规则自然重发)。
+                  涨停价按板块近似判定(limit_ratio);False 关闭(回测按开盘价
+                  无条件成交,与旧行为一致)
 
     每日目标持仓 = 当前攻防状态对应的"最近 k 条"(起始日期 <= 当日),与当前持仓按 ts_code 差分:
     - 差集卖出、新增买入,一律当日开盘价成交(卖出用 sell_open,引擎按开盘涨跌幅计当日收益)
@@ -93,9 +192,13 @@ def make_regime_rule(regime, defense_recs, x, y, z, max_open_gap=None):
     - 停牌日无法成交,引擎跳过当日动作,规则次日自然重发(持仓未变即重发)
     组合时刻满仓等权,权重由引擎归一化。
     """
+    if max_per_day is not None and int(max_per_day) < 1:
+        raise ValueError("max_per_day(配置 MAX_PER_DAY)需为 >= 1 的整数或 None")
+
     defense = list(defense_recs)
     defense_pos = {p for p, *_ in defense}
-    discarded = set()   # 开盘涨幅超阈值的推荐 pos:永久舍弃(视同无此推荐)
+    discarded = set()   # 永久舍弃的推荐 pos(开盘涨幅/前收涨幅两种过滤共用)
+    prev_bars = {}      # 上一交易日的 {ts_code: bar}(供前收涨幅过滤判定)
 
     def regime_position(date):
         for start, end, position in regime:
@@ -113,16 +216,28 @@ def make_regime_rule(regime, defense_recs, x, y, z, max_open_gap=None):
             pool = defense                       # 防守:防守 sheet 的最近 z 条
             k = z
 
-        # 开盘涨幅过滤(OPEN_GAP_SKIP):推荐首次将被买入的当天,开盘涨幅
-        # (开盘/昨收-1)> 阈值 → 永久舍弃,空出的坑由后面的推荐即时补位
-        # (补位者同日同样过检,循环到目标集稳定)。已持仓的不复检(过滤只看
-        # 买入当天);当日停牌无行情的无法判断,保持占坑,顺延到实际可成交日
-        # (规则次日重发)再检。discarded 状态只活在本实例内,一次回测新建
-        # 实例即重置。
+        # 前收涨幅过滤(PREV_DAY_GAIN_SKIP):推荐开始日期的前一交易日收盘涨幅
+        # > 阈值 → 永久舍弃。涨幅在推荐日前已确定,故在其 start_date 当天一次性
+        # 判定(prev_bars 即上一交易日的行情);与窗口进出无关。前一交易日停牌/
+        # 无行情的无法判定,不舍弃。与 prev_gain_discard() 同口径(计划页用)。
+        if prev_gain_skip is not None:
+            for pos, ts_code, _name, sd in recs:
+                if sd == date and pos not in discarded:
+                    pb = prev_bars.get(ts_code)
+                    prev = daily_return(pb.get("pct_chg")) if pb else None
+                    if prev is not None and prev > prev_gain_skip:
+                        discarded.add(pos)
+
+        # 开盘涨幅过滤(OPEN_GAP_SKIP)与涨停可成交性(LIMIT_UP_SKIP):
+        # 推荐首次将被买入的当天,开盘涨幅 > 阈值、或开盘已达涨停价(实盘
+        # 买不进)→ 永久舍弃,空出的坑由后面的推荐即时补位(补位者同日同样
+        # 过检,循环到目标集稳定)。已持仓的不复检(过滤只看买入当天);当日
+        # 停牌无行情的无法判断,保持占坑,顺延到实际可成交日(规则次日重发)
+        # 再检。discarded 状态只活在本实例内,一次回测新建实例即重置。
         while True:
             active = [r for r in pool if r[0] not in discarded]
-            target = target_keys(active, k)
-            if max_open_gap is None:
+            target = target_keys(active, k, max_per_day)
+            if max_open_gap is None and not limit_fill_skip:
                 break
             code_of = {pos: ts_code for pos, ts_code, *_ in active}
             newly = set()
@@ -130,8 +245,15 @@ def make_regime_rule(regime, defense_recs, x, y, z, max_open_gap=None):
                 if pos in holdings:
                     continue
                 bar = bars.get(code_of[pos])
-                gap = gap_return(bar.get("open"), bar.get("pre_close")) if bar else None
-                if gap is not None and gap > max_open_gap:
+                if bar is None:
+                    continue
+                gap = gap_return(bar.get("open"), bar.get("pre_close"))
+                if max_open_gap is not None and gap is not None and gap > max_open_gap:
+                    newly.add(pos)
+                    continue
+                if (limit_fill_skip
+                        and open_at_limit_up(code_of[pos], bar.get("open"),
+                                             bar.get("pre_close"))):
                     newly.add(pos)
             if not newly:
                 break
@@ -154,8 +276,20 @@ def make_regime_rule(regime, defense_recs, x, y, z, max_open_gap=None):
             keep_pos.add(olds[0])
         keep_codes = {holdings[p].code for p in keep_pos}
 
-        actions = [Action("sell_open", p, None) for p in sell if p not in keep_pos]
+        # 开盘跌停卖不出(LIMIT_UP_SKIP):当日不卖、持仓保留,规则次日自然重发;
+        # 同股卖旧买新的 keep_pos 旧仓不受影响(它本来就不卖)
+        def _sell_blocked(p):
+            h = holdings[p]
+            bar = bars.get(h.code)
+            return (limit_fill_skip and bar is not None
+                    and open_at_limit_down(h.code, bar.get("open"),
+                                           bar.get("pre_close")))
+
+        actions = [Action("sell_open", p, None) for p in sell
+                   if p not in keep_pos and not _sell_blocked(p)]
         actions += [Action("buy", p, None) for p in buy if buy_codes[p] not in keep_codes]
+        prev_bars.clear()
+        prev_bars.update(bars)   # 记为"上一交易日"行情,供次日的前收涨幅判定
         return actions
     return rule
 
