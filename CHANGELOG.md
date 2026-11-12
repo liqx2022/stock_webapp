@@ -2,6 +2,17 @@
 
 行为与口径变更按日期记录,方便回溯。策略口径的完整定义以 RULES.md 为准,本文件只记"改了什么、为什么"。
 
+## 2026-11-13
+
+### 工具
+
+- **新增 `monthly_compare.py`(独立命令行模块,不影响 app)**:个人实盘交割单(tran_records.xlsx,只读)FIFO+逐日盯市 vs 攻防转换回测净值,逐月对照"实际 vs 回测"差额,并输出执行检查(交易笔数/池外买入/短线平仓)。动机:实盘严格按交易计划执行后,差额即"不按计划程度"的度量计,目标收敛到滑点级别。回测侧复用 data_fetcher/backtest/rules/config,与「组合净值」tab 完全同口径;个人行情缓存独立在 `cache/personal_px.sqlite`(自动增量补拉,不污染 market.db);报告写 `output/monthly_compare_report.md`。用法与口径见文件 docstring;本金在文件顶部 CAPITAL 常量
+
+### 页面
+
+- **默认输入文件更名**:`stock_list_进攻.xlsx` → `stock_list_先知.xlsx`(池内容不变,仅文件名;与 `stock_list_梅森周.xlsx` 的命名对齐为老师名)。config.py `DEFAULT_INPUT_FILE` 同步更新,侧边栏默认选中新名
+- **日期区间跨 session 记忆**:每日持仓/组合净值的开始/结束日期存 `cache/ui_prefs.json`(cache/ 不入 git),任一日期框改动即持久化,刷新/重开页面还原上次区间;还原时把存的日期夹回当前数据范围,输入/行情变化不报错。实现:`app.py` `_load_ui_prefs`/`_save_ui_pref`/`_clamp_pref_date`,`_date_nav` 日期框加 `on_change` 整体保存
+
 ## 2026-11-12
 
 ### 口径/规则

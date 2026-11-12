@@ -17,6 +17,7 @@
 | data_fetcher.py | tushare 全部交互、SQLite 建表与读写、增量更新(只拉缺口) |
 | backtest.py | 回测引擎:推荐记录 + 行情 + 规则 → 每日持仓/组合净值/个股汇总 |
 | rules.py | 买卖规则(可插拔)。**改规则只动本文件,不要改 backtest.py** |
+| monthly_compare.py | 独立命令行工具(不走 app):个人交割单 FIFO+盯市 vs 回测净值,逐月对照执行偏差;报告写 output/。个人行情缓存在 cache/personal_px.sqlite |
 | indicators.py | 指标定义(与旧脚本口径一致) |
 | config.py | token、列名映射、输入/仓位文件名与策略参数(含密钥,已 gitignore,不入库) |
 
@@ -51,3 +52,4 @@
 - 名称匹配不上:侧边栏警告列出,可点"刷新股票名称表"
 - 改 config.py 策略参数(x/y/z/费率):保存后 ~2 秒页面自动重算(内置 fragment 监视文件);改 token/路径仍需重启
 - 输出旧版对照:旧脚本/旧数据在 `C:\workspace\python_mybasic\`(只读参考,勿改动)
+- 月度实盘对照:`.venv\Scripts\python.exe -X utf8 monthly_compare.py [起始日]`(每月末:交割单补进 tran_records.xlsx → app 点更新行情 → 跑);本金改文件顶部 CAPITAL 常量
