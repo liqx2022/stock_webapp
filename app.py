@@ -190,28 +190,46 @@ def _engine_stamp() -> str:
 
 
 # 策略参数作为 _run_backtest 签名的一部分:参数值变化 → 缓存自动失效重算
+def _build_rule_and_recs(recs_tuple: tuple, regime_key, x: float, y: int, z: int):
+    """推荐元组 + 仓位/防守状态 → (并入防守行的 recs_all, 规则实例)。每次调用新建规则。"""
+    recs = pd.DataFrame(list(recs_tuple),
+                        columns=["ts_code", "name", "start_date"])
+    if regime_key is None:
+        return recs, make_hold_n_days(10)  # 仓位/防守文件缺失时的退回规则
+    regime, defense = regime_key
+    # 防守行并入 recs 交给引擎(pos 编号接在进攻之后),引擎才知道防守代码、能执行买入
+    base = len(recs)
+    defense_rows = [(base + i, ts_code, name, start_date)
+                    for i, (_pid, ts_code, name, start_date) in enumerate(defense)]
+    recs_all = pd.concat(
+        [recs, pd.DataFrame([d[1:] for d in defense_rows],
+                            columns=["ts_code", "name", "start_date"])],
+        ignore_index=True)
+    return recs_all, make_regime_rule(list(regime), defense_rows, x, y, z)
+
+
+def _run_engine(recs_all, rule, db_key: str, version: int, fee: dict):
+    market = _load_market(db_key, version)
+    trade_dates = _load_trade_dates(db_key, version)
+    return backtest.run_backtest(recs_all, market, trade_dates, rule=rule, fee=fee)
+
+
 @st.cache_data(show_spinner=False)
 def _run_backtest(recs_tuple: tuple, regime_key, db_key: str, version: int,
                   x: float, y: int, z: int, fee: dict, engine_ver: str = ""):
-    recs = pd.DataFrame(list(recs_tuple),
-                        columns=["ts_code", "name", "start_date"])
-    market = _load_market(db_key, version)
-    trade_dates = _load_trade_dates(db_key, version)
-    if regime_key is None:
-        rule = make_hold_n_days(10)  # 仓位/防守文件缺失时的退回规则;每次重跑新建实例
-        recs_all = recs
-    else:
-        regime, defense = regime_key
-        # 防守行并入 recs 交给引擎(pos 编号接在进攻之后),引擎才知道防守代码、能执行买入
-        base = len(recs)
-        defense = [(base + i, ts_code, name, start_date)
-                   for i, (_pid, ts_code, name, start_date) in enumerate(defense)]
-        recs_all = pd.concat(
-            [recs, pd.DataFrame([d[1:] for d in defense],
-                                columns=["ts_code", "name", "start_date"])],
-            ignore_index=True)
-        rule = make_regime_rule(list(regime), defense, x, y, z)
-    return backtest.run_backtest(recs_all, market, trade_dates, rule=rule, fee=fee)
+    recs_all, rule = _build_rule_and_recs(recs_tuple, regime_key, x, y, z)
+    return _run_engine(recs_all, rule, db_key, version, fee)
+
+
+@st.cache_data(show_spinner=False)
+def _run_backtest_x0(recs_tuple: tuple, regime_key, db_key: str, version: int,
+                     y: int, z: int, fee: dict, engine_ver: str = ""):
+    """单押对比组合:X_THRESHOLD=0 的同规则回测(仓位表覆盖到的交易日永远进攻,
+    持最近 y 条推荐;未覆盖日仍按防守兜底)。其余口径(费率/停牌顺延/等权满仓)
+    与主回测一致,仅用于净值对比展示。"""
+    recs_all, rule = _build_rule_and_recs(recs_tuple, regime_key, 0.0, y, z)
+    _, portfolio, _ = _run_engine(recs_all, rule, db_key, version, fee)
+    return portfolio
 
 
 # ====================== 图表 ======================
@@ -239,10 +257,12 @@ def fig_daily_returns(portfolio: pd.DataFrame, sel_dt) -> go.Figure:
     return fig
 
 
-def fig_nav(portfolio: pd.DataFrame, sel_dt, bench: dict | None = None) -> go.Figure:
-    """组合净值曲线(粗线)+ 基准同期对比曲线(细线)。
+def fig_nav(portfolio: pd.DataFrame, sel_dt, bench: dict | None = None,
+            dan: list | None = None) -> go.Figure:
+    """组合净值曲线(粗线)+ 单押对照(虚线)+ 基准同期对比曲线(细线)。
 
     bench: {名称: 净值序列},由 indicators.benchmark_navs 按区间重定基(首日=1)。
+    dan:   单押(X_THRESHOLD=0)净值序列,与组合同区间重定基(首日=1)。
     单击图例项可隐藏/恢复该曲线(Plotly 原生交互),双击只看单条。
     """
     fig = go.Figure()
@@ -251,6 +271,12 @@ def fig_nav(portfolio: pd.DataFrame, sel_dt, bench: dict | None = None) -> go.Fi
         line=dict(color=NEUTRAL, width=3),
         hovertemplate="%{x|%Y-%m-%d}<br>组合 %{y:.4f}<extra></extra>",
     ))
+    if dan is not None:
+        fig.add_trace(go.Scatter(
+            x=portfolio["_dt"], y=dan, mode="lines", name="单押",
+            line=dict(color="#1565C0", width=1.8, dash="dash"),
+            hovertemplate="%{x|%Y-%m-%d}<br>单押 %{y:.4f}<extra></extra>",
+        ))
     for i, (name, ys) in enumerate((bench or {}).items()):
         fig.add_trace(go.Scatter(
             x=portfolio["_dt"], y=ys, mode="lines", name=name,
@@ -258,7 +284,7 @@ def fig_nav(portfolio: pd.DataFrame, sel_dt, bench: dict | None = None) -> go.Fi
             hovertemplate=f"%{{x|%Y-%m-%d}}<br>{name} %{{y:.4f}}<extra></extra>",
         ))
     fig.update_layout(**_base_layout("组合累计净值(区间起点 1,点击图例显隐)", 320, pct_y=False))
-    fig.update_layout(showlegend=bool(bench),
+    fig.update_layout(showlegend=bool(bench) or dan is not None,
                       legend=dict(orientation="h", yanchor="bottom", y=1.02,
                                   xanchor="right", x=1, font=dict(size=11)))
     fig.add_hline(y=1, line=dict(color="#999999", width=1, dash="dot"))
@@ -574,12 +600,29 @@ else:
                 p_show["nav"] = nav_rel
                 p_show["drawdown"] = nav_rel / nav_rel.cummax() - 1
             row = p_show[p_show["date"] == sel_dt].iloc[0]
-            m1, m2, m3, m4, m5 = st.columns(5)
-            m1.metric("净值", f"{row['nav']:.4f}")
-            m2.metric("当日收益", f"{row['account_return']:.2%}")
-            m3.metric("回撤", f"{row['drawdown']:.2%}")
-            m4.metric("持仓数", f"{int(row['n_stocks'])} 只")
-            m5.metric("当日费用", f"{row['fee']:.4%}")
+            # 单押对照(X_THRESHOLD=0):与组合同区间、同口径重定基(首日=1)
+            dan_nav = None
+            if regime_key is not None:
+                try:
+                    dan_pf = _run_backtest_x0(recs_tuple, regime_key, db_key, version,
+                                              y_off, z_def, fee, engine_ver=_engine_stamp())
+                    dan_show = dan_pf[(dan_pf["date"] >= start_str)
+                                      & (dan_pf["date"] <= end_str)]
+                    if not dan_show.empty and dan_show["nav"].iloc[0]:
+                        dan_nav = dan_show["nav"] / dan_show["nav"].iloc[0]
+                except Exception as e:
+                    st.warning(f"单押对照计算失败(不影响回测):{str(e)[:150]}")
+            cols = st.columns(6 if dan_nav is not None else 5)
+            cols[0].metric("净值", f"{row['nav']:.4f}")
+            cols[1].metric("当日收益", f"{row['account_return']:.2%}")
+            cols[2].metric("回撤", f"{row['drawdown']:.2%}")
+            cols[3].metric("持仓数", f"{int(row['n_stocks'])} 只")
+            cols[4].metric("当日费用", f"{row['fee']:.4%}")
+            if dan_nav is not None:
+                excess = row["nav"] - float(dan_nav.loc[row.name])
+                cols[5].metric("单押超额(净值差)", f"{excess:+.2%}",
+                               help="所选日期 组合净值 − 单押净值(均按区间起点重定基为 1),"
+                                    "即攻防转换相对“一直满仓押推荐”的超额;负值代表跑输单押")
             st.plotly_chart(fig_daily_returns(p_show, sel_dt_v),
                             width="stretch")
             # 基准对比:数据缺口自动补拉(失败只警告,不影响回测);曲线与组合同区间重定基
@@ -593,7 +636,9 @@ else:
                                        BENCHMARKS, BENCHMARK_COMBO)
             except Exception as e:
                 st.warning(f"基准数据加载失败(不影响回测):{str(e)[:150]}")
-            st.plotly_chart(fig_nav(p_show, sel_dt_v, bench), width="stretch")
+            st.plotly_chart(fig_nav(p_show, sel_dt_v, bench,
+                                    dan=dan_nav.tolist() if dan_nav is not None else None),
+                            width="stretch")
             st.plotly_chart(fig_drawdown(p_show, sel_dt_v), width="stretch")
 
     # ---------- Tab3 回测明细 ----------
