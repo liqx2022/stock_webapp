@@ -139,7 +139,8 @@ def _strategy_params():
     config.py 是纯数据文件,reload 无副作用。token/路径变更仍需重启。
     """
     importlib.reload(config)
-    return config.X_THRESHOLD, config.Y_OFFENSE, config.Z_DEFENSE, config.FEE
+    return (config.X_THRESHOLD, config.Y_OFFENSE, config.Z_DEFENSE,
+            config.FEE, config.OPEN_GAP_SKIP)
 
 
 _CONFIG_PATH = Path(config.__file__)
@@ -190,7 +191,8 @@ def _engine_stamp() -> str:
 
 
 # 策略参数作为 _run_backtest 签名的一部分:参数值变化 → 缓存自动失效重算
-def _build_rule_and_recs(recs_tuple: tuple, regime_key, x: float, y: int, z: int):
+def _build_rule_and_recs(recs_tuple: tuple, regime_key, x: float, y: int, z: int,
+                         gap: float | None = None):
     """推荐元组 + 仓位/防守状态 → (并入防守行的 recs_all, 规则实例)。每次调用新建规则。"""
     recs = pd.DataFrame(list(recs_tuple),
                         columns=["ts_code", "name", "start_date"])
@@ -205,7 +207,7 @@ def _build_rule_and_recs(recs_tuple: tuple, regime_key, x: float, y: int, z: int
         [recs, pd.DataFrame([d[1:] for d in defense_rows],
                             columns=["ts_code", "name", "start_date"])],
         ignore_index=True)
-    return recs_all, make_regime_rule(list(regime), defense_rows, x, y, z)
+    return recs_all, make_regime_rule(list(regime), defense_rows, x, y, z, gap)
 
 
 def _run_engine(recs_all, rule, db_key: str, version: int, fee: dict):
@@ -216,18 +218,20 @@ def _run_engine(recs_all, rule, db_key: str, version: int, fee: dict):
 
 @st.cache_data(show_spinner=False)
 def _run_backtest(recs_tuple: tuple, regime_key, db_key: str, version: int,
-                  x: float, y: int, z: int, fee: dict, engine_ver: str = ""):
-    recs_all, rule = _build_rule_and_recs(recs_tuple, regime_key, x, y, z)
+                  x: float, y: int, z: int, gap: float | None, fee: dict,
+                  engine_ver: str = ""):
+    recs_all, rule = _build_rule_and_recs(recs_tuple, regime_key, x, y, z, gap)
     return _run_engine(recs_all, rule, db_key, version, fee)
 
 
 @st.cache_data(show_spinner=False)
 def _run_backtest_x0(recs_tuple: tuple, regime_key, db_key: str, version: int,
-                     y: int, z: int, fee: dict, engine_ver: str = ""):
+                     y: int, z: int, gap: float | None, fee: dict,
+                     engine_ver: str = ""):
     """单押对比组合:X_THRESHOLD=0 的同规则回测(仓位表覆盖到的交易日永远进攻,
-    持最近 y 条推荐;未覆盖日仍按防守兜底)。其余口径(费率/停牌顺延/等权满仓)
-    与主回测一致,仅用于净值对比展示。"""
-    recs_all, rule = _build_rule_and_recs(recs_tuple, regime_key, 0.0, y, z)
+    持最近 y 条推荐;未覆盖日仍按防守兜底)。其余口径(开盘涨幅过滤/费率/停牌
+    顺延/等权满仓)与主回测一致,仅用于净值对比展示。"""
+    recs_all, rule = _build_rule_and_recs(recs_tuple, regime_key, 0.0, y, z, gap)
     _, portfolio, _ = _run_engine(recs_all, rule, db_key, version, fee)
     return portfolio
 
@@ -536,15 +540,16 @@ else:
     regime_key = None
     if regime_data:
         regime_key = (tuple(regime_data["regime"]), tuple(regime_data["defense"]))
-    x_th, y_off, z_def, fee = _strategy_params()
+    x_th, y_off, z_def, fee, gap_skip = _strategy_params()
     daily_holdings, portfolio, summary = _run_backtest(
-        recs_tuple, regime_key, db_key, version, x_th, y_off, z_def, fee,
+        recs_tuple, regime_key, db_key, version, x_th, y_off, z_def, gap_skip, fee,
         engine_ver=_engine_stamp())
 
     if portfolio.empty:
         st.info("数据库中还没有行情数据。点击侧边栏「初始化/更新行情数据」按钮。")
 
     tab1, tab2, tab3, tab4 = st.tabs(["每日持仓", "组合净值", "回测明细", "导出"])
+                                            "导出", "交易计划"])
 
     dates = portfolio["date"].tolist() if not portfolio.empty else []
     portfolio["_dt"] = pd.to_datetime(portfolio["date"])
@@ -605,7 +610,8 @@ else:
             if regime_key is not None:
                 try:
                     dan_pf = _run_backtest_x0(recs_tuple, regime_key, db_key, version,
-                                              y_off, z_def, fee, engine_ver=_engine_stamp())
+                                              y_off, z_def, gap_skip, fee,
+                                              engine_ver=_engine_stamp())
                     dan_show = dan_pf[(dan_pf["date"] >= start_str)
                                       & (dan_pf["date"] <= end_str)]
                     if not dan_show.empty and dan_show["nav"].iloc[0]:

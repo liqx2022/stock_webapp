@@ -18,11 +18,26 @@
 """
 from collections import namedtuple
 
+from indicators import gap_return
+
 Action = namedtuple("Action", ["op", "pos", "weight"])
 # op: "buy" | "sell";pos 为推荐唯一键(recs 里的 pos,引擎按它定位持仓);
 # weight 仅 buy 用(None 表示等权,权重由引擎归一化)
 
 Holding = namedtuple("Holding", ["code", "entry_date", "weight", "cum_return"])
+
+
+def target_keys(recs, k):
+    """最近 k 条:起始日期降序,截到第 k 条;与第 k 条同日期的全部保留。
+
+    recs 条目 (pos, ts_code, name, start_date)。攻防规则与交易计划页共用,
+    改这里两边同时生效。
+    """
+    if not recs or k <= 0:
+        return set()
+    ordered = sorted(recs, key=lambda r: r[3], reverse=True)
+    cutoff = ordered[min(k, len(ordered)) - 1][3]
+    return {r[0] for r in ordered if r[3] >= cutoff}
 
 
 def make_hold_n_days(hold_days: int = 10):
@@ -57,13 +72,18 @@ def make_hold_n_days(hold_days: int = 10):
     return rule
 
 
-def make_regime_rule(regime, defense_recs, x, y, z):
+def make_regime_rule(regime, defense_recs, x, y, z, max_open_gap=None):
     """攻防转换规则(完整口径见 RULES.md;参数在 config.py)。
 
     regime:       list[(start, end, position)],仓位区间,position 为"成"数(0~10)
     defense_recs: list[(pos, ts_code, name, start_date)],防守列表(与引擎 recs 同构)
     x:            仓位阈值,当日仓位 >= x → 进攻;仓位表未覆盖的日期按防守(保守)
     y / z:        进攻持有最近 y 条推荐 / 防守持有最近 z 条防守列表;同起始日期并列全部保留
+    max_open_gap: 开盘涨幅过滤阈值(config.py OPEN_GAP_SKIP):推荐首次将被买入的
+                  当天(停牌则顺延到实际可成交日),开盘涨幅(开盘/昨收-1)>
+                  阈值 → 永久舍弃(视同无此推荐,之后任何日期都不再买入),
+                  空出的坑由排序靠后的推荐即时补位(补位者同日同样过检);
+                  None 关闭;进攻/防守列表同口径
 
     每日目标持仓 = 当前攻防状态对应的"最近 k 条"(起始日期 <= 当日),与当前持仓按 ts_code 差分:
     - 差集卖出、新增买入,一律当日开盘价成交(卖出用 sell_open,引擎按开盘涨跌幅计当日收益)
@@ -75,6 +95,7 @@ def make_regime_rule(regime, defense_recs, x, y, z):
     """
     defense = list(defense_recs)
     defense_pos = {p for p, *_ in defense}
+    discarded = set()   # 开盘涨幅超阈值的推荐 pos:永久舍弃(视同无此推荐)
 
     def regime_position(date):
         for start, end, position in regime:
@@ -82,22 +103,39 @@ def make_regime_rule(regime, defense_recs, x, y, z):
                 return position
         return None  # 仓位表未覆盖 → 防守
 
-    def target_keys(recs, k):
-        """最近 k 条:起始日期降序,截到第 k 条;与第 k 条同日期的全部保留。"""
-        if not recs or k <= 0:
-            return set()
-        ordered = sorted(recs, key=lambda r: r[3], reverse=True)
-        cutoff = ordered[min(k, len(ordered)) - 1][3]
-        return {r[0] for r in ordered if r[3] >= cutoff}
-
     def rule(date, holdings, bars, recs):
         position = regime_position(date)
         if position is not None and position >= x:
             # 进攻只看选中 Excel 的推荐:引擎传入的 recs 已并入防守行,按 pos 排除
-            offense = [r for r in recs if r[0] not in defense_pos]
-            target = target_keys(offense, y)
+            pool = [r for r in recs if r[0] not in defense_pos]
+            k = y
         else:
-            target = target_keys(defense, z)    # 防守:防守 sheet 的最近 z 条
+            pool = defense                       # 防守:防守 sheet 的最近 z 条
+            k = z
+
+        # 开盘涨幅过滤(OPEN_GAP_SKIP):推荐首次将被买入的当天,开盘涨幅
+        # (开盘/昨收-1)> 阈值 → 永久舍弃,空出的坑由后面的推荐即时补位
+        # (补位者同日同样过检,循环到目标集稳定)。已持仓的不复检(过滤只看
+        # 买入当天);当日停牌无行情的无法判断,保持占坑,顺延到实际可成交日
+        # (规则次日重发)再检。discarded 状态只活在本实例内,一次回测新建
+        # 实例即重置。
+        while True:
+            active = [r for r in pool if r[0] not in discarded]
+            target = target_keys(active, k)
+            if max_open_gap is None:
+                break
+            code_of = {pos: ts_code for pos, ts_code, *_ in active}
+            newly = set()
+            for pos in target:
+                if pos in holdings:
+                    continue
+                bar = bars.get(code_of[pos])
+                gap = gap_return(bar.get("open"), bar.get("pre_close")) if bar else None
+                if gap is not None and gap > max_open_gap:
+                    newly.add(pos)
+            if not newly:
+                break
+            discarded.update(newly)
 
         sell = [p for p in holdings if p not in target]
         buy = [p for p in target if p not in holdings]
