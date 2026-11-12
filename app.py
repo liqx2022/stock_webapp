@@ -4,6 +4,7 @@ r"""股票推荐回测 Web 应用(Streamlit 唯一入口)。
 """
 from datetime import datetime, timedelta
 import importlib
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -358,6 +359,36 @@ def _nearest_trade_date(dates: list[str], d: str) -> str:
     return before if (t - pd.Timestamp(before)) <= (pd.Timestamp(after) - t) else after
 
 
+def _load_ui_prefs() -> dict:
+    """UI 偏好(跨 session 记忆),存 cache/ui_prefs.json(不入 git)。"""
+    try:
+        return json.loads((DB_PATH.parent / "ui_prefs.json").read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_ui_pref(key: str, value) -> None:
+    prefs = _load_ui_prefs()
+    prefs[key] = value
+    try:
+        (DB_PATH.parent / "ui_prefs.json").write_text(
+            json.dumps(prefs, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass  # 偏好写失败不影响功能,退回默认行为
+
+
+def _clamp_pref_date(raw, first: str, last: str):
+    """偏好里存的日期夹回当前数据范围内(输入文件/行情变了也不报错)。"""
+    if not raw:
+        return None
+    try:
+        d = pd.Timestamp(raw).date()
+    except Exception:
+        return None
+    lo, hi = pd.Timestamp(first).date(), pd.Timestamp(last).date()
+    return min(max(d, lo), hi)
+
+
 def _date_nav(prefix: str, dates: list[str], label: str,
               with_end: bool = True) -> tuple[str, str, str]:
     """日期选择控件 + 滑块。
@@ -398,19 +429,30 @@ def _date_nav(prefix: str, dates: list[str], label: str,
     start_key = f"{prefix}_start"
     end_key = f"{prefix}_end"
     if start_key not in ss:
-        ss[start_key] = pd.Timestamp(first).date()
+        prefs = _load_ui_prefs()
+        ss[start_key] = (_clamp_pref_date(prefs.get(start_key), first, last)
+                         or pd.Timestamp(first).date())
     if end_key not in ss:
-        ss[end_key] = pd.Timestamp(last).date()
+        prefs = _load_ui_prefs()
+        ss[end_key] = (_clamp_pref_date(prefs.get(end_key), first, last)
+                       or pd.Timestamp(last).date())
+
+    def _save_range():
+        # 任一日期框改动都把当前区间整体持久化,刷新页面后仍还原
+        _save_ui_pref(start_key, str(ss[start_key]))
+        _save_ui_pref(end_key, str(ss[end_key]))
 
     c0, c1 = st.columns(2)
     with c0:
         start_val = st.date_input("开始日期", min_value=pd.Timestamp(first).date(),
                                   max_value=pd.Timestamp(last).date(),
-                                  format="YYYY-MM-DD", key=start_key)
+                                  format="YYYY-MM-DD", key=start_key,
+                                  on_change=_save_range)
     with c1:
         end_val = st.date_input("结束日期", min_value=pd.Timestamp(first).date(),
                                 max_value=pd.Timestamp(last).date(),
-                                format="YYYY-MM-DD", key=end_key)
+                                format="YYYY-MM-DD", key=end_key,
+                                on_change=_save_range)
 
     start_str, end_str = str(start_val), str(end_val)
     start_idx = next((i for i, d in enumerate(dates) if d >= start_str), len(dates) - 1)

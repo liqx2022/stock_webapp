@@ -78,7 +78,7 @@ MAX_RETRY = 4
 
 # 策略参数(攻防转换,详见 RULES.md)
 REGIME_FILE_NAME = "stock_list_仓位及防守.xlsx"
-DEFAULT_INPUT_FILE = "stock_list_进攻.xlsx"
+DEFAULT_INPUT_FILE = "stock_list_先知.xlsx"
 X_THRESHOLD = 4.5       # 仓位 >= x 成 → 进攻
 Y_OFFENSE = 6           # 进攻持最近 y 条推荐
 Z_DEFENSE = 2           # 防守持最近 z 条防守列表
@@ -103,7 +103,7 @@ BENCHMARK_COMBO = {
 
 ### 3. 准备输入文件(放到 `input/` 目录)
 
-- **进攻推荐列表**(默认 `stock_list_进攻.xlsx`):第一个 sheet,包含「股票名称」「起始日期」两列,每行一条推荐(每天手动追加)
+- **先知推荐列表**(默认 `stock_list_先知.xlsx`):第一个 sheet,包含「股票名称」「起始日期」两列,每行一条推荐(每天手动追加)
 - **仓位/防守文件**(`stock_list_仓位及防守.xlsx`):
   - 「仓位」sheet:起始日期 | 结束日期 | 仓位(数值,0~10 成)
   - 「防守」sheet:股票代码 | 股票名称 | 起始日期(代码缺失时按名称匹配;港股代码请存文本格式)
