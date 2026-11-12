@@ -80,6 +80,17 @@ def fetch_daily(ts_code: str, start: str, end: str) -> pd.DataFrame:
     return df.sort_values("trade_date").reset_index(drop=True)
 
 
+def fetch_index_daily(ts_code: str, start: str, end: str) -> pd.DataFrame:
+    """拉指数日线(pro.index_daily)。start/end 为 'YYYY-MM-DD',API 用 'YYYYMMDD'。"""
+    start8, end8 = start.replace("-", ""), end.replace("-", "")
+    df = _call_with_retry(pro.index_daily, ts_code=ts_code, start_date=start8, end_date=end8)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.copy()
+    df["trade_date"] = pd.to_datetime(df["trade_date"], format="%Y%m%d").dt.strftime("%Y-%m-%d")
+    return df.sort_values("trade_date").reset_index(drop=True)
+
+
 def fetch_trade_calendar(start: str, end: str) -> pd.DataFrame:
     """交易日历(SSE 口径)。"""
     df = _call_with_retry(pro.trade_cal, exchange="SSE",
@@ -313,6 +324,77 @@ def update_market_data(recs: pd.DataFrame, progress_cb=None, db_path=DB_PATH) ->
         _set_meta(conn, "last_update", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     stats["elapsed"] = round(time.time() - t0, 1)
     return stats
+
+
+def get_bench_version(db_path=DB_PATH) -> int:
+    """基准数据版本号:ensure_benchmarks 实际写入新行时 +1(用于页面缓存失效)。"""
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        v = _get_meta(conn, "bench_version")
+        return int(v) if v else 0
+
+
+def ensure_benchmarks(codes: list[str], start: str, progress_cb=None,
+                      db_path=DB_PATH) -> dict:
+    """增量拉取基准指数/ETF 日线,与股票同存 daily_bars 表。
+    指数走 index_daily,ETF(515080 等)走 fetch_daily 的 fund_daily 兜底。
+    start 为回测最早日('YYYY-MM-DD');只拉缺口,失败记 skipped 下次自动补。
+    返回 stats 结构同 update_market_data。仅在写入新行时递增 bench_version,
+    避免页面每次重跑都空转递增。"""
+    init_db(db_path)
+    stats = {"updated": 0, "new_rows": 0, "skipped": [], "elapsed": 0.0}
+    t0 = time.time()
+    today = datetime.now().strftime("%Y-%m-%d")
+    with _connect(db_path) as conn:
+        for i, ts_code in enumerate(codes):
+            if progress_cb:
+                progress_cb(i, len(codes), ts_code)
+            try:
+                row_min, row_max = conn.execute(
+                    "SELECT MIN(trade_date), MAX(trade_date) FROM daily_bars WHERE ts_code=?",
+                    (ts_code,)).fetchone()
+                if row_min is None:
+                    pull_start = start
+                else:
+                    pull_start = str((datetime.strptime(row_max, "%Y-%m-%d") +
+                                      timedelta(days=1)).date())
+                pull_end = today
+                if pull_start > pull_end:
+                    continue  # 已是最新
+                fetch = fetch_daily if is_etf(ts_code) else fetch_index_daily
+                df = fetch(ts_code, pull_start, pull_end)
+                if df.empty:
+                    stats["skipped"].append({"ts_code": ts_code, "name": ts_code,
+                                             "reason": "无数据"})
+                    continue
+                df["ts_code"] = ts_code
+                df[["ts_code", "trade_date", "open", "high", "low", "close",
+                    "pre_close", "pct_chg", "vol"]].to_sql(
+                    "daily_bars", conn, if_exists="append", index=False)
+                stats["updated"] += 1
+                stats["new_rows"] += len(df)
+            except Exception as e:
+                stats["skipped"].append({"ts_code": ts_code, "name": ts_code,
+                                         "reason": str(e)[:200]})
+        if stats["new_rows"]:
+            _set_meta(conn, "bench_version", str(int(_get_meta(conn, "bench_version") or 0) + 1))
+            _set_meta(conn, "benchmarks_update", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    stats["elapsed"] = round(time.time() - t0, 1)
+    return stats
+
+
+def load_benchmark_data(codes: list[str], db_path=DB_PATH) -> pd.DataFrame:
+    """读基准代码的日线长表(ts_code/trade_date/close/pct_chg)。"""
+    init_db(db_path)
+    if not codes:
+        return pd.DataFrame(columns=["ts_code", "trade_date", "close", "pct_chg"])
+    placeholders = ",".join("?" for _ in codes)
+    with _connect(db_path) as conn:
+        df = pd.read_sql(
+            f"SELECT ts_code, trade_date, close, pct_chg FROM daily_bars "
+            f"WHERE ts_code IN ({placeholders}) ORDER BY ts_code, trade_date",
+            conn, params=list(codes))
+    return df
 
 
 def load_market_data(db_path=DB_PATH) -> pd.DataFrame:

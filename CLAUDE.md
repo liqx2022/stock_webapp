@@ -18,7 +18,7 @@
 | backtest.py | 回测引擎:推荐记录 + 行情 + 规则 → 每日持仓/组合净值/个股汇总 |
 | rules.py | 买卖规则(可插拔)。**改规则只动本文件,不要改 backtest.py** |
 | indicators.py | 指标定义(与旧脚本口径一致) |
-| config.py | token 与列名映射(含密钥,已 gitignore,不入库) |
+| config.py | token、列名映射、输入/仓位文件名与策略参数(含密钥,已 gitignore,不入库) |
 
 ## 数据流
 

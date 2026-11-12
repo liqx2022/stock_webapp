@@ -14,7 +14,8 @@ import config
 import data_fetcher as fetcher
 import backtest
 from config import (TS_TOKEN, DB_PATH, INPUT_DIR, OUTPUT_DIR, EXCEL_COLUMNS,
-                    REGIME_FILE_NAME)
+                    REGIME_FILE_NAME, DEFAULT_INPUT_FILE, BENCHMARKS, BENCHMARK_COMBO)
+from indicators import benchmark_navs
 from rules import make_hold_n_days, make_regime_rule
 
 st.set_page_config(page_title="股票推荐回测", layout="wide",
@@ -29,6 +30,7 @@ NEUTRAL = "#1F4E79"    # 净值曲线
 MARKER = "#888888"     # 日期推进虚线
 GRID = "rgba(0,0,0,0.08)"
 GREEN_FILL = "rgba(46,125,50,0.25)"
+BENCH_COLORS = ["#E65100", "#6A1B9A", "#2E7D32", "#B71C1C", "#00838F"]  # 基准曲线配色
 
 
 def _ensure_dirs():
@@ -168,6 +170,17 @@ def _load_trade_dates(db_key: str, version: int) -> list:
     return fetcher.load_trade_dates(db_key)
 
 
+@st.cache_data(show_spinner=False)
+def _ensure_benchmarks(db_key: str, bench_ver: int, start: str, codes: tuple) -> dict:
+    """基准数据缺口自动补拉(按 bench_version/区间起点缓存,缺什么补什么)。"""
+    return fetcher.ensure_benchmarks(list(codes), start)
+
+
+@st.cache_data(show_spinner=False)
+def _load_benchmarks(db_key: str, bench_ver: int, codes: tuple) -> pd.DataFrame:
+    return fetcher.load_benchmark_data(list(codes))
+
+
 def _engine_stamp() -> str:
     """引擎源码 mtime 指纹:backtest/rules/indicators 代码一改,缓存 key 随之变化,
     避免输入文件没变时页面继续用旧口径的回测结果(如改 bug 后买入日期仍旧值)。"""
@@ -226,13 +239,28 @@ def fig_daily_returns(portfolio: pd.DataFrame, sel_dt) -> go.Figure:
     return fig
 
 
-def fig_nav(portfolio: pd.DataFrame, sel_dt) -> go.Figure:
-    fig = go.Figure(go.Scatter(
-        x=portfolio["_dt"], y=portfolio["nav"], mode="lines",
-        line=dict(color=NEUTRAL, width=2),
-        hovertemplate="%{x|%Y-%m-%d}<br>净值 %{y:.4f}<extra></extra>",
+def fig_nav(portfolio: pd.DataFrame, sel_dt, bench: dict | None = None) -> go.Figure:
+    """组合净值曲线(粗线)+ 基准同期对比曲线(细线)。
+
+    bench: {名称: 净值序列},由 indicators.benchmark_navs 按区间重定基(首日=1)。
+    单击图例项可隐藏/恢复该曲线(Plotly 原生交互),双击只看单条。
+    """
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=portfolio["_dt"], y=portfolio["nav"], mode="lines", name="组合",
+        line=dict(color=NEUTRAL, width=3),
+        hovertemplate="%{x|%Y-%m-%d}<br>组合 %{y:.4f}<extra></extra>",
     ))
-    fig.update_layout(**_base_layout("组合累计净值(区间起点 1)", 320, pct_y=False))
+    for i, (name, ys) in enumerate((bench or {}).items()):
+        fig.add_trace(go.Scatter(
+            x=portfolio["_dt"], y=ys, mode="lines", name=name,
+            line=dict(color=BENCH_COLORS[i % len(BENCH_COLORS)], width=1.4),
+            hovertemplate=f"%{{x|%Y-%m-%d}}<br>{name} %{{y:.4f}}<extra></extra>",
+        ))
+    fig.update_layout(**_base_layout("组合累计净值(区间起点 1,点击图例显隐)", 320, pct_y=False))
+    fig.update_layout(showlegend=bool(bench),
+                      legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                                  xanchor="right", x=1, font=dict(size=11)))
     fig.add_hline(y=1, line=dict(color="#999999", width=1, dash="dot"))
     fig.add_vline(x=sel_dt, line=dict(color=MARKER, width=1, dash="dash"))
     return fig
@@ -390,8 +418,12 @@ with st.sidebar:
     uploaded = st.file_uploader("上传 Excel(xlsx)", type=["xlsx"])
     existing_files = sorted(f for f in INPUT_DIR.glob("*.xlsx")
                             if not f.name.startswith("~$"))  # 排除 Excel 锁文件
-    existing = st.selectbox("或选择 input/ 目录已有文件",
-                            ["— 不选择 —"] + [f.name for f in existing_files])
+    existing_names = ["— 不选择 —"] + [f.name for f in existing_files]
+    # 默认选中 config.py DEFAULT_INPUT_FILE(浏览器刷新后 session 清空,index 重新生效)
+    default_idx = (existing_names.index(DEFAULT_INPUT_FILE)
+                   if DEFAULT_INPUT_FILE in existing_names else 0)
+    existing = st.selectbox("或选择 input/ 目录已有文件", existing_names,
+                            index=default_idx, key="sel_existing")
 
     if uploaded is not None:
         _ensure_dirs()
@@ -550,7 +582,18 @@ else:
             m5.metric("当日费用", f"{row['fee']:.4%}")
             st.plotly_chart(fig_daily_returns(p_show, sel_dt_v),
                             width="stretch")
-            st.plotly_chart(fig_nav(p_show, sel_dt_v), width="stretch")
+            # 基准对比:数据缺口自动补拉(失败只警告,不影响回测);曲线与组合同区间重定基
+            codes_all = tuple(BENCHMARKS) + tuple(c for cs in BENCHMARK_COMBO.values()
+                                                  for c in cs)
+            bench = {}
+            try:
+                _ensure_benchmarks(db_key, fetcher.get_bench_version(), dates[0], codes_all)
+                bench_df = _load_benchmarks(db_key, fetcher.get_bench_version(), codes_all)
+                bench = benchmark_navs(bench_df, p_show["date"].tolist(),
+                                       BENCHMARKS, BENCHMARK_COMBO)
+            except Exception as e:
+                st.warning(f"基准数据加载失败(不影响回测):{str(e)[:150]}")
+            st.plotly_chart(fig_nav(p_show, sel_dt_v, bench), width="stretch")
             st.plotly_chart(fig_drawdown(p_show, sel_dt_v), width="stretch")
 
     # ---------- Tab3 回测明细 ----------

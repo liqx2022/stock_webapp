@@ -69,11 +69,11 @@ def run_backtest(recs: pd.DataFrame, market: pd.DataFrame, trade_dates: list[str
     dates = [d for d in trade_dates if min_rec <= d <= max_data]
 
     rec_rows = {pos: recs.iloc[pos].to_dict() for pos in range(len(recs))}
-    first_bar = {}   # ts_code -> 首个有行情的日期(用于区分"未进场"与"真缺数据")
+    last_bar = {}    # ts_code -> 最晚有行情的日期(用于区分"未进场"与"真缺数据")
     for d, day in bars_by_date.items():
         for code in day:
-            if code not in first_bar or d < first_bar[code]:
-                first_bar[code] = d
+            if code not in last_bar or d > last_bar[code]:
+                last_bar[code] = d
 
     holdings = {}          # pos -> Holding(code=ts_code)
     holding_rows = []      # daily_holdings 行
@@ -229,15 +229,15 @@ def run_backtest(recs: pd.DataFrame, market: pd.DataFrame, trade_dates: list[str
     for pos, info in rec_rows.items():
         entry_date, rec_date, name = entry_info.get(
             pos, (None, info["start_date"], info["name"]))
-        fb = first_bar.get(info["ts_code"])
+        lb = last_bar.get(info["ts_code"])
         if pos in entry_info:
             status = "正常"
         elif info["start_date"] > max_data:
             status = "未到买入日"  # 推荐日晚于最新行情日,尚未到达买入时间
-        elif fb is not None and fb >= info["start_date"]:
-            status = "未进场"  # 有行情但从未进入目标窗口(防守期发布/被新推荐挤出)
+        elif lb is not None and lb >= info["start_date"]:
+            status = "未进场"  # 推荐日后有行情但从未进入目标窗口(防守期发布/被新推荐挤出)
         else:
-            status = "无行情数据"  # 整个区间无任何行情(数据缺失/代码错)
+            status = "无行情数据"  # 推荐日之后整个区间无行情(长期停牌/退市/代码错)
         rec_summary_rows.append({
             "code": info["ts_code"], "name": info["name"], "rec_date": info["start_date"],
             "entry_date": entry_date,
