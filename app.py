@@ -257,7 +257,8 @@ def _base_layout(title: str, height: int, pct_y: bool) -> dict:
         title=dict(text=title, font=dict(size=14)),
         height=height, margin=dict(t=40, b=30, l=55, r=15),
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        xaxis=dict(gridcolor=GRID, tickfont=dict(size=11)),
+        xaxis=dict(gridcolor=GRID, tickfont=dict(size=11),
+                   tickformat="%m-%d"),   # 坐标只显示 月-日(如 11-02),悬停仍看完整日期
         yaxis=dict(gridcolor=GRID, tickfont=dict(size=11),
                    tickformat=".0%" if pct_y else None),
         hovermode="x unified", showlegend=False,
@@ -317,6 +318,132 @@ def fig_nav(portfolio: pd.DataFrame, sel_dt, bench: dict | None = None,
     fig.add_hline(y=1, line=dict(color="#999999", width=1, dash="dot"))
     fig.add_vline(x=sel_dt, line=dict(color=MARKER, width=1, dash="dash"))
     return fig
+
+
+# ====================== 图例显隐记忆(隐形桥接组件) ======================
+# 1.67 的 st.plotly_chart 直接把 Plotly 画在主文档(.js-plotly-plot,无 iframe)。
+# 本组件不渲染任何可见内容、不碰图表本身,只在浏览器里定位净值图 div:
+# 加载后按 ui_prefs 应用上次显隐,并监听 plotly_restyle(图例单击/双击都触发)
+# 回传可见曲线名,由 Python 写 ui_prefs.json。图例点击从此有记忆。
+# 失败模式:若未来 Streamlit 改了内部 DOM 结构,选择器找不到图 → 仅记忆功能
+# 失效,页面渲染完全不受影响(图本体仍是原生 st.plotly_chart)。
+_LEGEND_SYNC_JS = """\
+export default function (component) {
+  const { data, parentElement, setStateValue } = component
+
+  // 重渲染时 export 会重跑,而 gd 上的事件处理器随每次 plotly newPlot 被清空——
+  // 用挂在容器上的可变 store 让处理器始终读到最新 data,并用定时巡检重挂
+  const store = (parentElement._legendStore = parentElement._legendStore || { lastSig: null })
+  store.saved = data.saved
+
+  function visibleNames(gd) {
+    const out = []
+    for (const t of gd.data || []) {
+      if (t.name) out.push([t.name, t.visible !== false && t.visible !== "legendonly"])
+    }
+    return out.filter((p) => p[1]).map((p) => p[0])
+  }
+
+  function sig(gd) { return visibleNames(gd).join("|") }
+
+  function isNavChart(gd) {
+    try {
+      const t = gd._fullLayout && gd._fullLayout.title && gd._fullLayout.title.text
+      return (typeof t === "string" && t.indexOf("组合累计净值") !== -1) ||
+             (gd.data || []).some((tr) => tr.name === "组合")
+    } catch (e) { return false }
+  }
+
+  function applySaved(gd) {
+    if (!Array.isArray(store.saved)) return
+    const want = new Set(store.saved)
+    const idx = [], vals = []
+    ;(gd.data || []).forEach((tr, i) => {
+      const v = tr.name && !want.has(tr.name) ? "legendonly" : true
+      if (tr.visible !== v) { idx.push(i); vals.push(v) }
+    })
+    if (!idx.length) return
+    // plotly 新版已移除 gd.restyle 等 div 方法;用全局 Plotly(Streamlit 已暴露)
+    const P = window.Plotly
+    if (P && typeof P.restyle === "function") P.restyle(gd, { visible: vals }, idx)
+    store.lastSig = sig(gd)
+  }
+
+  function onRestyle(gd) {
+    const s = sig(gd)
+    if (gd._legendSig !== s) {           // 去重:applySaved 触发的 restyle 不回传
+      gd._legendSig = s
+      store.lastSig = s
+      setStateValue("visible", visibleNames(gd))   // → Python 落盘
+    }
+  }
+
+  // newPlot 会清掉 gd 的全部事件监听并重置 visible;监听器在 = 图没被重画。
+  // 监听器丢了 → 重挂 + 重放存档;监听器还在但显隐变了 → 用户点了图例 → 回传。
+  // 另:图在隐藏 tab 里时 restyle 不生效,所以「首次变为可见」也要重放一次存档
+  // (对隐藏图重放无害,可见时对齐才是关键)。
+  function tick() {
+    document.querySelectorAll(".js-plotly-plot").forEach((gd) => {
+      if (!isNavChart(gd)) return
+      // 监听器登记在 gd._ev._events(EventEmitter 实例);newPlot 清空它
+      const evReg = gd._ev && gd._ev._events
+      const hasListener = evReg ? !!evReg.plotly_restyle : gd._legendHooked
+      if (!hasListener) {
+        if (gd.removeAllListeners) {
+          gd.removeAllListeners("plotly_restyle")
+          gd.removeAllListeners("plotly_react")
+        }
+        if (typeof gd.on !== "function") return
+        gd.on("plotly_restyle", () => onRestyle(gd))
+        gd.on("plotly_react", () => applySaved(gd))
+        gd._legendHooked = true
+        gd._legendAppliedVis = false
+        applySaved(gd)
+        store.lastSig = sig(gd)
+        return
+      }
+      const visNow = gd.getBoundingClientRect().width > 50
+      if (visNow && !gd._legendAppliedVis) {
+        gd._legendAppliedVis = true
+        applySaved(gd)
+        return
+      }
+      const s = sig(gd)
+      if (s !== store.lastSig) {
+        store.lastSig = s
+        gd._legendSig = s
+        setStateValue("visible", visibleNames(gd))
+      }
+    })
+  }
+
+  if (!parentElement._scanTimer) parentElement._scanTimer = setInterval(tick, 400)
+  tick()
+
+  return () => {
+    if (parentElement._scanTimer) { clearInterval(parentElement._scanTimer); parentElement._scanTimer = null }
+  }
+}
+"""
+
+_LEGEND_SYNC = st.components.v2.component(
+    "legend_sync", html="<div style='display:none'></div>", js=_LEGEND_SYNC_JS)
+LEGEND_SYNC_KEY = "legend_sync"
+
+
+def legend_sync() -> None:
+    """挂载图例显隐记忆组件:组件回传状态优先,否则读 ui_prefs.json。"""
+    comp_state = st.session_state.get(LEGEND_SYNC_KEY, {})
+    saved = (comp_state["visible"] if "visible" in comp_state
+             else _load_ui_prefs().get("nav_shown"))
+
+    def _on_visible_change():
+        val = st.session_state.get(LEGEND_SYNC_KEY, {}).get("visible")
+        if val is not None:
+            _save_ui_pref("nav_shown", list(val))
+
+    _LEGEND_SYNC(key=LEGEND_SYNC_KEY, data={"saved": saved},
+                 on_visible_change=_on_visible_change)
 
 
 def fig_drawdown(portfolio: pd.DataFrame, sel_dt) -> go.Figure:
@@ -405,7 +532,7 @@ def _date_nav(prefix: str, dates: list[str], label: str,
       改卡片 → 滑块/持仓跟随(非交易日就近对齐到交易日);拖滑块 → 卡片跟随。
     with_end=True(组合净值):开始/结束日期定义展示区间,滑块在区间内选日,
       图表随区间截取,净值按区间重定基。
-    quick=True(需 with_end=True):区间上方加快捷按钮 本月/近三月/今年/全部,
+    quick=True(需 with_end=True):区间上方加快捷按钮 本周/本月/近三月/今年/全部,
       点击即写入开始/结束日期并持久化(与手动改日期框同一偏好存储)。
     prefix 区分两个 tab 的控件 key;只影响展示,不影响回测。
     返回 (选中日期, 开始日期, 结束日期),均为 'YYYY-MM-DD' 字符串。
@@ -453,14 +580,15 @@ def _date_nav(prefix: str, dates: list[str], label: str,
         base = pd.Timestamp(dates[-1])
         lo, hi = pd.Timestamp(first).date(), pd.Timestamp(last).date()
         presets = {
+            "本周": base - pd.Timedelta(days=base.day_of_week),   # 所选日所在周的周一
             "本月": base.replace(day=1),
             "近三月": (base - pd.DateOffset(months=2)).replace(day=1),   # 上上个月 1 号起(含本月共 3 个自然月)
             "今年": base.replace(month=1, day=1),
             "全部": pd.Timestamp("2025-09-01"),   # 池子/净值的有效起点
         }
         picked = None
-        for name, col in zip(presets, st.columns(4)):
-            if col.button(name, key=f"{prefix}_qr_{name}", use_container_width=True):
+        for name, col in zip(presets, st.columns(5)):
+            if col.button(name, key=f"{prefix}_qr_{name}", width="stretch"):
                 picked = (min(max(presets[name].date(), lo), hi), hi)
         if picked:
             ss[start_key], ss[end_key] = picked
@@ -716,14 +844,15 @@ else:
     if portfolio.empty:
         st.info("数据库中还没有行情数据。点击侧边栏「初始化/更新行情数据」按钮。")
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["每日持仓", "组合净值", "回测明细",
-                                            "导出", "交易计划"])
+    # tab 顺序(从左到右):组合净值(默认选中)、每日持仓、交易计划、回测明细、导出
+    tab_nav, tab_hold, tab_plan, tab_detail, tab_export = st.tabs(
+        ["组合净值", "每日持仓", "交易计划", "回测明细", "导出"])
 
     dates = portfolio["date"].tolist() if not portfolio.empty else []
     portfolio["_dt"] = pd.to_datetime(portfolio["date"])
 
     # ---------- Tab1 每日持仓 ----------
-    with tab1:
+    with tab_hold:
         if not dates:
             st.info("暂无数据")
         else:
@@ -759,7 +888,7 @@ else:
                            f"累计收益自买入日起复利(买入日实体涨幅、之后全日涨跌幅)")
 
     # ---------- Tab2 组合净值 ----------
-    with tab2:
+    with tab_nav:
         if not dates:
             st.info("暂无数据")
         else:
@@ -790,19 +919,6 @@ else:
                         dan_nav = dan_show["nav"] / dan_base
                 except Exception as e:
                     st.warning(f"单押对照计算失败(不影响回测):{str(e)[:150]}")
-            cols = st.columns(6 if dan_nav is not None else 5)
-            cols[0].metric("净值", f"{row['nav']:.4f}")
-            cols[1].metric("当日收益", f"{row['account_return']:.2%}")
-            cols[2].metric("回撤", f"{row['drawdown']:.2%}")
-            cols[3].metric("持仓数", f"{int(row['n_stocks'])} 只")
-            cols[4].metric("当日费用", f"{row['fee']:.4%}")
-            if dan_nav is not None:
-                excess = row["nav"] - float(dan_nav.loc[row.name])
-                cols[5].metric("单押超额(净值差)", f"{excess:+.2%}",
-                               help="所选日期 组合净值 − 单押净值(均按区间前一交易日收盘重定基为 1),"
-                                    "即攻防转换相对“一直满仓押推荐”的超额;负值代表跑输单押")
-            st.plotly_chart(fig_daily_returns(p_show, sel_dt_v),
-                            width="stretch")
             # 基准对比:数据缺口自动补拉(失败只警告,不影响回测)
             # 曲线与组合同口径:前一交易日收盘 = 1 —— 把前一日并入序列交给 benchmark_navs
             # (其「首日=1、首日涨跌不进曲线」的口径正好落在前一日上),再截掉首日
@@ -819,13 +935,85 @@ else:
                 bench = {k: v[1:] for k, v in bench_raw.items()} if prior else bench_raw
             except Exception as e:
                 st.warning(f"基准数据加载失败(不影响回测):{str(e)[:150]}")
-            st.plotly_chart(fig_nav(p_show, sel_dt_v, bench,
-                                    dan=dan_nav.tolist() if dan_nav is not None else None),
-                            width="stretch")
-            st.plotly_chart(fig_drawdown(p_show, sel_dt_v), width="stretch")
+
+            # 月/年收益率:选定区间内的费后日收益(account_return - fee)按月/年复利
+            def _period_returns(fmt: str, label: str) -> pd.DataFrame:
+                return (p_show.assign(_net=lambda d: d["account_return"] - d["fee"],
+                                      _p=lambda d: pd.to_datetime(d["date"]).dt.strftime(fmt))
+                              .groupby("_p", sort=True)["_net"]
+                              .apply(lambda s: (1 + s).prod() - 1)
+                              .reset_index()
+                              .rename(columns={"_p": label, "_net": "收益率"}))
+
+            sub_day, sub_month, sub_year = st.tabs(["日收益", "月收益", "年收益"])
+            with sub_day:
+                cols = st.columns(6 if dan_nav is not None else 5)
+                cols[0].metric("净值", f"{row['nav']:.4f}")
+                cols[1].metric("当日收益", f"{row['account_return']:.2%}")
+                cols[2].metric("回撤", f"{row['drawdown']:.2%}")
+                cols[3].metric("持仓数", f"{int(row['n_stocks'])} 只")
+                cols[4].metric("当日费用", f"{row['fee']:.4%}")
+                if dan_nav is not None:
+                    excess = row["nav"] - float(dan_nav.loc[row.name])
+                    cols[5].metric("单押超额(净值差)", f"{excess:+.2%}",
+                                   help="所选日期 组合净值 − 单押净值(均按区间前一交易日收盘重定基为 1),"
+                                        "即攻防转换相对“一直满仓押推荐”的超额;负值代表跑输单押")
+                st.plotly_chart(fig_daily_returns(p_show, sel_dt_v),
+                                width="stretch")
+                st.plotly_chart(fig_nav(p_show, sel_dt_v, bench,
+                                        dan=dan_nav.tolist() if dan_nav is not None else None),
+                                width="stretch")
+                legend_sync()   # 图例显隐记忆(隐形组件,不渲染内容)
+                st.plotly_chart(fig_drawdown(p_show, sel_dt_v), width="stretch")
+            with sub_month:
+                st.caption("每月一个收益率:区间内该月各交易日费后收益(account_return−fee)复利;"
+                           "随上方开始/结束日期联动")
+                # 月历色块:真 3 行 × 4 列,每格 = 月份 + 当月收益率,红涨绿跌(配色同表格)
+                _ms = p_show.assign(_net=lambda d: d["account_return"] - d["fee"],
+                                    _y=lambda d: pd.to_datetime(d["date"]).dt.strftime("%Y"),
+                                    _m=lambda d: pd.to_datetime(d["date"]).dt.month)
+                _rets = _ms.groupby(["_y", "_m"])["_net"].apply(
+                    lambda s: (1 + s).prod() - 1)
+
+                def _chip(label: str, v) -> str:
+                    """单个月份色块(背景/字色规则同 _pct_cell)。"""
+                    if pd.isna(v):
+                        return ("<div style='background:#F5F5F5;color:#BDBDBD;"
+                                "border-radius:6px;padding:6px 8px;text-align:center;'>"
+                                f"<div style='font-size:0.8em;'>{label}</div>"
+                                "<div style='font-size:1.15em;font-weight:600;'>—</div></div>")
+                    if v > 0.01:
+                        bg, fg, sign = "#FFE6E6", "#B71C1C", "+"
+                    elif v < -0.01:
+                        bg, fg, sign = "#E6FFE6", "#1B5E20", ""
+                    else:
+                        bg, fg, sign = "#F5F5F5", "#616161", ""
+                    return (f"<div style='background:{bg};color:{fg};"
+                            "border-radius:6px;padding:6px 8px;text-align:center;'>"
+                            f"<div style='font-size:0.8em;opacity:0.8;'>{label}</div>"
+                            f"<div style='font-size:1.15em;font-weight:600;'>"
+                            f"{sign}{v:.2%}</div></div>")
+
+                for _year in sorted(_rets.index.get_level_values(0).unique()):
+                    st.markdown(f"**{_year} 年**")
+                    for _row in range(3):
+                        cols = st.columns(4, gap="small")
+                        for _ci in range(4):
+                            _mno = _row * 4 + _ci + 1
+                            _v = _rets.get((_year, _mno), float("nan"))
+                            with cols[_ci]:
+                                st.markdown(_chip(f"{_mno}月", _v),
+                                            unsafe_allow_html=True)
+                    st.write("")
+            with sub_year:
+                st.caption("每年一个收益率:口径同上,按年复利")
+                st.dataframe(_period_returns("%Y", "年份")
+                             .style.format({"收益率": "{:.2%}"})
+                             .map(_pct_cell, subset=["收益率"]),
+                             hide_index=True, width="content")
 
     # ---------- Tab3 回测明细 ----------
-    with tab3:
+    with tab_detail:
         if summary.empty:
             st.info("暂无数据")
         else:
@@ -858,7 +1046,7 @@ else:
                         st.write(s)
 
     # ---------- Tab4 导出 ----------
-    with tab4:
+    with tab_export:
         st.markdown("导出文件写入 output/ 目录")
 
         def _write_export(df: pd.DataFrame, prefix: str):
@@ -896,7 +1084,7 @@ else:
                     st.info("暂无数据可导出")
 
     # ---------- Tab5 交易计划 ----------
-    with tab5:
+    with tab_plan:
         if regime_data is None or recs is None or recs.empty:
             st.info("需要仓位/防守文件与推荐数据,先在侧边栏选择输入 Excel")
         else:

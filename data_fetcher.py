@@ -63,7 +63,9 @@ def is_etf(ts_code: str) -> bool:
 
 
 def fetch_daily(ts_code: str, start: str, end: str) -> pd.DataFrame:
-    """拉日线。兜底顺序:pro.daily → ETF 用 pro.fund_daily → .HK 用 pro.hk_daily。
+    """拉日线。兜底顺序:pro.daily → ETF 用 pro.fund_daily → .HK 用 pro.hk_daily
+    → 仍为空再试 ts.pro_bar(2026-11 实测 daily 接口偶发整段返回空,而 pro_bar
+    同区间有数据;pro_bar 含 open/high/low/close/pre_close/pct_chg/vol,口径一致)。
     start/end 为 'YYYY-MM-DD',API 用 'YYYYMMDD'。
     """
     start8, end8 = start.replace("-", ""), end.replace("-", "")
@@ -73,6 +75,12 @@ def fetch_daily(ts_code: str, start: str, end: str) -> pd.DataFrame:
             df = _call_with_retry(pro.hk_daily, ts_code=ts_code, start_date=start8, end_date=end8)
         elif is_etf(ts_code):
             df = _call_with_retry(pro.fund_daily, ts_code=ts_code, start_date=start8, end_date=end8)
+    if df is None or df.empty:
+        bar = ts.pro_bar(ts_code=ts_code, api=pro,
+                         start_date=start8, end_date=end8,
+                         fields="ts_code,trade_date,open,high,low,close,"
+                                "pre_close,pct_chg,vol")
+        df = bar
     if df is None or df.empty:
         return pd.DataFrame()
     df = df.copy()
@@ -103,12 +111,29 @@ def fetch_trade_calendar(start: str, end: str) -> pd.DataFrame:
     return df
 
 
+def _paged_call(func, page_size: int = 5000, **kwargs) -> pd.DataFrame:
+    """tushare 列表接口单次调用有行数上限(约 5000),超限会静默截断;
+    用 offset 分页拉全量,某页不足 page_size 即结束。"""
+    parts, offset = [], 0
+    while True:
+        df = _call_with_retry(func, offset=offset, limit=page_size, **kwargs)
+        if df is None or df.empty:
+            break
+        parts.append(df)
+        if len(df) < page_size:
+            break
+        offset += page_size
+    if not parts:
+        return pd.DataFrame()
+    return pd.concat(parts, ignore_index=True).drop_duplicates()
+
+
 def fetch_name_map() -> pd.DataFrame:
     """全市场名称→代码映射(A 股 + 港股 + 场内基金)。"""
-    df_a = _call_with_retry(pro.stock_basic, exchange="", list_status="L",
-                            fields="ts_code,symbol,name")
-    df_hk = _call_with_retry(pro.hk_basic, fields="ts_code,symbol,name")
-    if df_a is None or df_hk is None:
+    df_a = _paged_call(pro.stock_basic, exchange="", list_status="L",
+                       fields="ts_code,symbol,name")
+    df_hk = _paged_call(pro.hk_basic, fields="ts_code,symbol,name")
+    if df_a is None or df_a.empty or df_hk is None:
         raise RuntimeError("股票列表拉取失败")
     # 场内基金(ETF/LOF):market='E' 只取场内,避免场外基金代码与股票冲突
     df_fund = _call_with_retry(pro.fund_basic, market="E", fields="ts_code,name")

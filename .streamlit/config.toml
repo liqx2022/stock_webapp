@@ -1,0 +1,10 @@
+# Streamlit 配置
+[browser]
+# 关闭匿名使用统计:它会请求 data.streamlit.io,网络不通时控制台一直报
+# ERR_CONNECTION_RESET / "Failed to fetch metrics config"(纯遥测噪音)
+gatherUsageStats = false
+
+[theme]
+# 收紧页面顶部留白(默认约 6rem,浪费屏幕;"0" = 紧贴 header 下沿;
+# 注意必须带引号,TOML 裸数字会被 Streamlit 忽略)
+paddingTop = "0"
