@@ -936,20 +936,59 @@ else:
             except Exception as e:
                 st.warning(f"基准数据加载失败(不影响回测):{str(e)[:150]}")
 
-            # 月/年收益率:选定区间内的费后日收益(account_return - fee)按月/年复利
-            def _period_returns(fmt: str, label: str) -> pd.DataFrame:
-                return (p_show.assign(_net=lambda d: d["account_return"] - d["fee"],
-                                      _p=lambda d: pd.to_datetime(d["date"]).dt.strftime(fmt))
-                              .groupby("_p", sort=True)["_net"]
-                              .apply(lambda s: (1 + s).prod() - 1)
-                              .reset_index()
-                              .rename(columns={"_p": label, "_net": "收益率"}))
+            # 对比基准选择器:日/月/年三个视图共用(默认双创)
+            _bench_opts = (["双创"] + [k for k in bench if k != "双创"]
+                           + (["单押"] if dan_nav is not None else []))
+            if "bench_choice" in st.session_state and \
+                    st.session_state.bench_choice not in _bench_opts:
+                del st.session_state.bench_choice
+            if _bench_opts:
+                _bc = st.columns([1, 3])
+                with _bc[0]:
+                    bench_sel = st.selectbox("对比基准", _bench_opts,
+                                             key="bench_choice")
+            else:
+                bench_sel = None
+
+            def _bench_daily_series(sel):
+                """基准逐日收益(与 p_show 逐行对齐):由重定基净值序列还原;无则 None。"""
+                if sel == "单押":
+                    base = dan_nav.tolist() if dan_nav is not None else None
+                elif sel is not None:
+                    base = bench.get(sel)
+                else:
+                    base = None
+                if not base:
+                    return None
+                out, prev = [], 1.0
+                for _v in base:
+                    _v = float(_v)
+                    out.append(_v / prev - 1 if prev else 0.0)
+                    prev = _v
+                return out
+
+            def _period_frame(fmt: str, label: str) -> pd.DataFrame:
+                """区间内按 fmt 分组:组合(及选中基准)的费后复利收益与超额。"""
+                _b = _bench_daily_series(bench_sel)
+                _d = p_show.assign(_net=lambda d: d["account_return"] - d["fee"],
+                                   _p=lambda d: pd.to_datetime(d["date"]).dt.strftime(fmt))
+                if _b is not None:
+                    _d = _d.assign(_b=_b)
+                agg = {"收益率": ("_net", lambda s: (1 + s).prod() - 1)}
+                if _b is not None:
+                    agg["基准"] = ("_b", lambda s: (1 + s).prod() - 1)
+                out = _d.groupby("_p", sort=True).agg(**agg)
+                out = out.reset_index().rename(columns={"_p": label})
+                if _b is not None:
+                    out["超额"] = out["收益率"] - out["基准"]
+                return out
 
             sub_day, sub_month, sub_year = st.tabs(["日收益", "月收益", "年收益"])
             with sub_day:
-                n_cols = 5 + (1 if dan_nav is not None else 0) \
-                           + (1 if "双创" in bench else 0)
-                cols = st.columns(n_cols)
+                _has_bench_card = (bench_sel == "单押" and dan_nav is not None) \
+                    or (bench_sel is not None and bench_sel in bench)
+                cols = st.columns(5 + (1 if dan_nav is not None else 0)
+                                  + (1 if _has_bench_card else 0))
                 cols[0].metric("净值", f"{row['nav']:.4f}")
                 cols[1].metric("当日收益", f"{row['account_return']:.2%}")
                 cols[2].metric("回撤", f"{row['drawdown']:.2%}")
@@ -962,14 +1001,14 @@ else:
                                       help="所选日期 组合净值 − 单押净值(均按区间前一交易日收盘重定基为 1),"
                                            "即攻防转换相对“一直满仓押推荐”的超额;负值代表跑输单押")
                     _pos += 1
-                if "双创" in bench:
-                    _sc = bench["双创"]              # 与 p_show 逐日对齐的净值列表
-                    _i = p_show.index.get_loc(row.name)
-                    sc_excess = row["nav"] - float(_sc[_i])
-                    cols[_pos].metric("双创超额(净值差)", f"{sc_excess:+.2%}",
-                                      help="所选日期 组合净值 − 双创同期净值(双创 = 创业板指 + 科创综指"
-                                           "等权合成,与组合同区间、按区间前一交易日收盘重定基为 1),"
-                                           "衡量相对成长风格的超额;负值代表跑输双创")
+                if _has_bench_card:
+                    _bv = (float(dan_nav.loc[row.name]) if bench_sel == "单押"
+                           else float(bench[bench_sel][p_show.index.get_loc(row.name)]))
+                    sc_excess = row["nav"] - _bv
+                    cols[_pos].metric(f"{bench_sel}超额(净值差)", f"{sc_excess:+.2%}",
+                                      help=f"所选日期 组合净值 − {bench_sel}同期净值"
+                                           "(与组合同区间、按区间前一交易日收盘重定基为 1);"
+                                           "负值代表跑输该基准;对比基准可在上方下拉切换")
                 st.plotly_chart(fig_daily_returns(p_show, sel_dt_v),
                                 width="stretch")
                 st.plotly_chart(fig_nav(p_show, sel_dt_v, bench,
@@ -978,16 +1017,17 @@ else:
                 legend_sync()   # 图例显隐记忆(隐形组件,不渲染内容)
                 st.plotly_chart(fig_drawdown(p_show, sel_dt_v), width="stretch")
             with sub_month:
-                st.caption("每月一个收益率:区间内该月各交易日费后收益(account_return−fee)复利;"
-                           "随上方开始/结束日期联动")
-                # 月历色块:真 3 行 × 4 列,每格 = 月份 + 当月收益率,红涨绿跌(配色同表格)
-                _ms = p_show.assign(_net=lambda d: d["account_return"] - d["fee"],
-                                    _y=lambda d: pd.to_datetime(d["date"]).dt.strftime("%Y"),
-                                    _m=lambda d: pd.to_datetime(d["date"]).dt.month)
-                _rets = _ms.groupby(["_y", "_m"])["_net"].apply(
-                    lambda s: (1 + s).prod() - 1)
+                st.caption(f"每月一个收益率:区间内该月各交易日费后收益(account_return−fee)复利;"
+                           f"右下角为组合相对 {bench_sel or '基准'} 同期收益的超额;随上方日期联动")
+                # 月历色块:真 3 行 × 4 列,每格 = 月份 + 当月收益率 + 对比基准超额(右下角)
+                _pfm = _period_frame("%Y-%m", "月份")
+                _ret_map, _exc_map = {}, {}
+                for _, _r in _pfm.iterrows():
+                    _yy, _mm = _r["月份"].split("-")
+                    _ret_map[(int(_yy), int(_mm))] = _r["收益率"]
+                    _exc_map[(int(_yy), int(_mm))] = _r.get("超额", float("nan"))
 
-                def _chip(label: str, v) -> str:
+                def _chip(label: str, v, excess=None) -> str:
                     """单个月份色块(背景/字色规则同 _pct_cell)。"""
                     if pd.isna(v):
                         return ("<div style='background:#F5F5F5;color:#BDBDBD;"
@@ -1000,28 +1040,40 @@ else:
                         bg, fg, sign = "#E6FFE6", "#1B5E20", ""
                     else:
                         bg, fg, sign = "#F5F5F5", "#616161", ""
+                    _extra = ""
+                    if excess is not None and not pd.isna(excess):
+                        _ec = "#B71C1C" if excess > 0.005 else \
+                            ("#1B5E20" if excess < -0.005 else "#757575")
+                        _es = "+" if excess > 0 else ""
+                        _extra = (f"<div style='text-align:right;font-size:0.72em;"
+                                  f"color:{_ec};margin-top:3px;'>vs {bench_sel} "
+                                  f"{_es}{excess:.2%}</div>")
                     return (f"<div style='background:{bg};color:{fg};"
                             "border-radius:6px;padding:6px 8px;text-align:center;'>"
                             f"<div style='font-size:0.8em;opacity:0.8;'>{label}</div>"
                             f"<div style='font-size:1.15em;font-weight:600;'>"
-                            f"{sign}{v:.2%}</div></div>")
+                            f"{sign}{v:.2%}</div>{_extra}</div>")
 
-                for _year in sorted(_rets.index.get_level_values(0).unique()):
+                for _year in sorted(set(y for y, _ in _ret_map)):
                     st.markdown(f"**{_year} 年**")
                     for _row in range(3):
                         cols = st.columns(4, gap="small")
                         for _ci in range(4):
                             _mno = _row * 4 + _ci + 1
-                            _v = _rets.get((_year, _mno), float("nan"))
+                            _v = _ret_map.get((_year, _mno), float("nan"))
+                            _e = _exc_map.get((_year, _mno), float("nan"))
                             with cols[_ci]:
-                                st.markdown(_chip(f"{_mno}月", _v),
+                                st.markdown(_chip(f"{_mno}月", _v, _e),
                                             unsafe_allow_html=True)
                     st.write("")
             with sub_year:
-                st.caption("每年一个收益率:口径同上,按年复利")
-                st.dataframe(_period_returns("%Y", "年份")
-                             .style.format({"收益率": "{:.2%}"})
-                             .map(_pct_cell, subset=["收益率"]),
+                st.caption(f"每年一个收益率:口径同上,按年复利;"
+                           f"超额 = 组合年收益 − {bench_sel or '基准'}年收益")
+                _pfy = _period_frame("%Y", "年份")
+                _sub = ["收益率"] + ([c for c in ("基准", "超额") if c in _pfy.columns])
+                st.dataframe(_pfy.style
+                             .format(formatter={c: "{:.2%}" for c in _sub}, na_rep="")
+                             .map(_pct_cell, subset=_sub),
                              hide_index=True, width="content")
 
     # ---------- Tab3 回测明细 ----------
