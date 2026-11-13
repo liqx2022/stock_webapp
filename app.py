@@ -276,12 +276,20 @@ def fig_daily_returns(portfolio: pd.DataFrame, sel_dt) -> go.Figure:
     return fig
 
 
+def _base_nav_before(pf: pd.DataFrame, start_str: str) -> float:
+    """区间重定基基准:开始日**前一交易日**的收盘净值,区间首日自身的当日收益计入曲线;
+    开始日已是全历史首日(无前一日)时为 1.0(引擎初始净值,首日收益从绝对起点起算)。"""
+    prev = pf[pf["date"] < start_str]
+    base = float(prev["nav"].iloc[-1]) if len(prev) else 1.0
+    return base or 1.0
+
+
 def fig_nav(portfolio: pd.DataFrame, sel_dt, bench: dict | None = None,
             dan: list | None = None) -> go.Figure:
     """组合净值曲线(粗线)+ 单押对照(虚线)+ 基准同期对比曲线(细线)。
 
-    bench: {名称: 净值序列},由 indicators.benchmark_navs 按区间重定基(首日=1)。
-    dan:   单押(X_THRESHOLD=0)净值序列,与组合同区间重定基(首日=1)。
+    bench: {名称: 净值序列},与组合同区间、按前一交易日收盘重定基(=1)。
+    dan:   单押(X_THRESHOLD=0)净值序列,与组合同区间、同口径重定基。
     单击图例项可隐藏/恢复该曲线(Plotly 原生交互),双击只看单条。
     """
     fig = go.Figure()
@@ -302,7 +310,7 @@ def fig_nav(portfolio: pd.DataFrame, sel_dt, bench: dict | None = None,
             line=dict(color=BENCH_COLORS[i % len(BENCH_COLORS)], width=1.4),
             hovertemplate=f"%{{x|%Y-%m-%d}}<br>{name} %{{y:.4f}}<extra></extra>",
         ))
-    fig.update_layout(**_base_layout("组合累计净值(区间起点 1,点击图例显隐)", 320, pct_y=False))
+    fig.update_layout(**_base_layout("组合累计净值(区间前一交易日=1,点击图例显隐)", 320, pct_y=False))
     fig.update_layout(showlegend=bool(bench) or dan is not None,
                       legend=dict(orientation="h", yanchor="bottom", y=1.02,
                                   xanchor="right", x=1, font=dict(size=11)))
@@ -390,13 +398,15 @@ def _clamp_pref_date(raw, first: str, last: str):
 
 
 def _date_nav(prefix: str, dates: list[str], label: str,
-              with_end: bool = True) -> tuple[str, str, str]:
+              with_end: bool = True, quick: bool = False) -> tuple[str, str, str]:
     """日期选择控件 + 滑块。
 
     with_end=False(每日持仓):单个「日期」卡片即所选日期,与滑块双向同步——
       改卡片 → 滑块/持仓跟随(非交易日就近对齐到交易日);拖滑块 → 卡片跟随。
     with_end=True(组合净值):开始/结束日期定义展示区间,滑块在区间内选日,
       图表随区间截取,净值按区间重定基。
+    quick=True(需 with_end=True):区间上方加快捷按钮 本月/近三月/今年/全部,
+      点击即写入开始/结束日期并持久化(与手动改日期框同一偏好存储)。
     prefix 区分两个 tab 的控件 key;只影响展示,不影响回测。
     返回 (选中日期, 开始日期, 结束日期),均为 'YYYY-MM-DD' 字符串。
     """
@@ -436,6 +446,26 @@ def _date_nav(prefix: str, dates: list[str], label: str,
         prefs = _load_ui_prefs()
         ss[end_key] = (_clamp_pref_date(prefs.get(end_key), first, last)
                        or pd.Timestamp(last).date())
+
+    if quick:
+        # 快捷区间(同花顺式)。按钮必须在日期框之前渲染:点击后先写 session_state,
+        # 日期框随后实例化即取到新值(widget 实例化后再改状态会抛异常)。
+        base = pd.Timestamp(dates[-1])
+        lo, hi = pd.Timestamp(first).date(), pd.Timestamp(last).date()
+        presets = {
+            "本月": base.replace(day=1),
+            "近三月": (base - pd.DateOffset(months=2)).replace(day=1),   # 上上个月 1 号起(含本月共 3 个自然月)
+            "今年": base.replace(month=1, day=1),
+            "全部": pd.Timestamp("2025-09-01"),   # 池子/净值的有效起点
+        }
+        picked = None
+        for name, col in zip(presets, st.columns(4)):
+            if col.button(name, key=f"{prefix}_qr_{name}", use_container_width=True):
+                picked = (min(max(presets[name].date(), lo), hi), hi)
+        if picked:
+            ss[start_key], ss[end_key] = picked
+            _save_ui_pref(start_key, str(picked[0]))
+            _save_ui_pref(end_key, str(picked[1]))
 
     def _save_range():
         # 任一日期框改动都把当前区间整体持久化,刷新页面后仍还原
@@ -733,13 +763,15 @@ else:
         if not dates:
             st.info("暂无数据")
         else:
-            sel_dt, start_str, end_str = _date_nav("d2", dates, "推进日期")
+            sel_dt, start_str, end_str = _date_nav("d2", dates, "推进日期", quick=True)
             sel_dt_v = pd.to_datetime(sel_dt)
-            # 图表跟随起止日期;净值按区间重定基:开始日 = 1,回撤按区间内峰值重算
+            # 图表跟随起止日期;净值按区间重定基:区间**前一交易日**收盘 = 1,
+            # 区间首日自身的当日收益计入曲线(否则选两天会丢首日收益);回撤按区间内峰值重算
             p_show = portfolio[(portfolio["date"] >= start_str)
                                & (portfolio["date"] <= end_str)].copy()
-            if not p_show.empty and p_show["nav"].iloc[0]:
-                nav_rel = p_show["nav"] / p_show["nav"].iloc[0]
+            base_nav = _base_nav_before(portfolio, start_str)
+            if not p_show.empty and base_nav:
+                nav_rel = p_show["nav"] / base_nav
                 p_show["nav"] = nav_rel
                 p_show["drawdown"] = nav_rel / nav_rel.cummax() - 1
             row = p_show[p_show["date"] == sel_dt].iloc[0]
@@ -753,8 +785,9 @@ else:
                                               engine_ver=_engine_stamp())
                     dan_show = dan_pf[(dan_pf["date"] >= start_str)
                                       & (dan_pf["date"] <= end_str)]
-                    if not dan_show.empty and dan_show["nav"].iloc[0]:
-                        dan_nav = dan_show["nav"] / dan_show["nav"].iloc[0]
+                    dan_base = _base_nav_before(dan_pf, start_str)
+                    if not dan_show.empty and dan_base:
+                        dan_nav = dan_show["nav"] / dan_base
                 except Exception as e:
                     st.warning(f"单押对照计算失败(不影响回测):{str(e)[:150]}")
             cols = st.columns(6 if dan_nav is not None else 5)
@@ -766,19 +799,24 @@ else:
             if dan_nav is not None:
                 excess = row["nav"] - float(dan_nav.loc[row.name])
                 cols[5].metric("单押超额(净值差)", f"{excess:+.2%}",
-                               help="所选日期 组合净值 − 单押净值(均按区间起点重定基为 1),"
+                               help="所选日期 组合净值 − 单押净值(均按区间前一交易日收盘重定基为 1),"
                                     "即攻防转换相对“一直满仓押推荐”的超额;负值代表跑输单押")
             st.plotly_chart(fig_daily_returns(p_show, sel_dt_v),
                             width="stretch")
-            # 基准对比:数据缺口自动补拉(失败只警告,不影响回测);曲线与组合同区间重定基
+            # 基准对比:数据缺口自动补拉(失败只警告,不影响回测)
+            # 曲线与组合同口径:前一交易日收盘 = 1 —— 把前一日并入序列交给 benchmark_navs
+            # (其「首日=1、首日涨跌不进曲线」的口径正好落在前一日上),再截掉首日
             codes_all = tuple(BENCHMARKS) + tuple(c for cs in BENCHMARK_COMBO.values()
                                                   for c in cs)
             bench = {}
             try:
                 _ensure_benchmarks(db_key, fetcher.get_bench_version(), dates[0], codes_all)
                 bench_df = _load_benchmarks(db_key, fetcher.get_bench_version(), codes_all)
-                bench = benchmark_navs(bench_df, p_show["date"].tolist(),
-                                       BENCHMARKS, BENCHMARK_COMBO)
+                prior = [d for d in dates if d < start_str]
+                bench_dates = ([prior[-1]] if prior else []) + p_show["date"].tolist()
+                bench_raw = benchmark_navs(bench_df, bench_dates,
+                                           BENCHMARKS, BENCHMARK_COMBO)
+                bench = {k: v[1:] for k, v in bench_raw.items()} if prior else bench_raw
             except Exception as e:
                 st.warning(f"基准数据加载失败(不影响回测):{str(e)[:150]}")
             st.plotly_chart(fig_nav(p_show, sel_dt_v, bench,
@@ -917,6 +955,29 @@ else:
                     plan_df = plan_df.sort_values(
                         "操作", key=lambda s: s.map(order)).reset_index(drop=True)
                     st.dataframe(plan_df, width="stretch", hide_index=True)
+                # 快照存档:留痕“当天计划是什么”(行情/参数变了计划会变),供月度对照做计划 vs 实际成交核对
+                if st.button("存档今日计划", key="btn_plan_snapshot"):
+                    snap = {
+                        "plan_date": plan_date,
+                        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "offense": bool(plan["offense"]),
+                        "pos": plan["pos"],
+                        "pos_inherited": bool(plan["inherited"]),
+                        "cur_bars_date": plan["cur_date"],
+                        "params": {"x": x_th, "y": y_off, "z": z_def, "max_per_day": mpd,
+                                   "prev_gain_skip": prev_skip, "open_gap_skip": gap_skip,
+                                   "limit_up_skip": limit_fill},
+                        "target": [[int(p), *plan["lookup"][p][1:]]
+                                   for p in sorted(plan["target"])],
+                        "actions": rows,
+                        "notes": plan["notes"],
+                    }
+                    snap_dir = OUTPUT_DIR / "plan_snapshots"
+                    snap_dir.mkdir(parents=True, exist_ok=True)
+                    snap_path = snap_dir / f"{plan_date}.json"
+                    snap_path.write_text(json.dumps(snap, ensure_ascii=False, indent=1),
+                                         encoding="utf-8")
+                    st.success(f"已存档 {plan_date} 计划 → {snap_path}")
                 _gap_note = (f"开盘涨幅过滤:新买入股票当日开盘涨幅(开盘/昨收-1)超 "
                              f"{gap_skip:.0%} 时实盘会直接舍弃该推荐(视同无此股票,"
                              "永不买入)、由后续推荐补位,计划表无法预知次日开盘价,"
