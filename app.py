@@ -1009,8 +1009,18 @@ else:
                                       help=f"所选日期 组合净值 − {bench_sel}同期净值"
                                            "(与组合同区间、按区间前一交易日收盘重定基为 1);"
                                            "负值代表跑输该基准;对比基准可在上方下拉切换")
-                st.plotly_chart(fig_daily_returns(p_show, sel_dt_v),
-                                width="stretch")
+                # 每日账户收益柱图开关(记忆到 ui_prefs):关掉后净值曲线上移
+                _daily_key = "show_daily_bars"
+                if _daily_key not in st.session_state:
+                    st.session_state[_daily_key] = _load_ui_prefs().get(_daily_key, True)
+
+                def _save_show_daily():
+                    _save_ui_pref(_daily_key, bool(st.session_state[_daily_key]))
+
+                st.toggle("显示每日账户收益图", key=_daily_key, on_change=_save_show_daily)
+                if st.session_state[_daily_key]:
+                    st.plotly_chart(fig_daily_returns(p_show, sel_dt_v),
+                                    width="stretch")
                 st.plotly_chart(fig_nav(p_show, sel_dt_v, bench,
                                         dan=dan_nav.tolist() if dan_nav is not None else None),
                                 width="stretch")
