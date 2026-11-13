@@ -947,17 +947,29 @@ else:
 
             sub_day, sub_month, sub_year = st.tabs(["日收益", "月收益", "年收益"])
             with sub_day:
-                cols = st.columns(6 if dan_nav is not None else 5)
+                n_cols = 5 + (1 if dan_nav is not None else 0) \
+                           + (1 if "双创" in bench else 0)
+                cols = st.columns(n_cols)
                 cols[0].metric("净值", f"{row['nav']:.4f}")
                 cols[1].metric("当日收益", f"{row['account_return']:.2%}")
                 cols[2].metric("回撤", f"{row['drawdown']:.2%}")
                 cols[3].metric("持仓数", f"{int(row['n_stocks'])} 只")
                 cols[4].metric("当日费用", f"{row['fee']:.4%}")
+                _pos = 5
                 if dan_nav is not None:
                     excess = row["nav"] - float(dan_nav.loc[row.name])
-                    cols[5].metric("单押超额(净值差)", f"{excess:+.2%}",
-                                   help="所选日期 组合净值 − 单押净值(均按区间前一交易日收盘重定基为 1),"
-                                        "即攻防转换相对“一直满仓押推荐”的超额;负值代表跑输单押")
+                    cols[_pos].metric("单押超额(净值差)", f"{excess:+.2%}",
+                                      help="所选日期 组合净值 − 单押净值(均按区间前一交易日收盘重定基为 1),"
+                                           "即攻防转换相对“一直满仓押推荐”的超额;负值代表跑输单押")
+                    _pos += 1
+                if "双创" in bench:
+                    _sc = bench["双创"]              # 与 p_show 逐日对齐的净值列表
+                    _i = p_show.index.get_loc(row.name)
+                    sc_excess = row["nav"] - float(_sc[_i])
+                    cols[_pos].metric("双创超额(净值差)", f"{sc_excess:+.2%}",
+                                      help="所选日期 组合净值 − 双创同期净值(双创 = 创业板指 + 科创综指"
+                                           "等权合成,与组合同区间、按区间前一交易日收盘重定基为 1),"
+                                           "衡量相对成长风格的超额;负值代表跑输双创")
                 st.plotly_chart(fig_daily_returns(p_show, sel_dt_v),
                                 width="stretch")
                 st.plotly_chart(fig_nav(p_show, sel_dt_v, bench,

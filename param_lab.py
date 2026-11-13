@@ -29,18 +29,14 @@ POOLS = {
     "梅森周": "input/stock_list_梅森周.xlsx",
     "先知": "input/stock_list_先知.xlsx",
     "先知PPT": "input/stock_list_先知PPT.xlsx",
+    "拐点": "input/stock_list_拐点.xlsx",
 }
+# 拐点池 y 细扫(1~15)× mpd(1/3)对照
 VARIANTS = [
     # (名称, 池, y, max_per_day, dedup, open_gap, prev_gain)
-    ("先知-现状参数(对照)", "先知", 10, 1, False, None, None),
-    ("梅森-最优参数(对照)",  "梅森周", 20, 3, True,  None, 0.05),
-    ("PPT-现状参数照搬",     "先知PPT", 10, 1, False, None, None),
-    ("PPT-y10×2",           "先知PPT", 10, 2, True,  None, None),
-    ("PPT-y15×2",           "先知PPT", 15, 2, True,  None, None),
-    ("PPT-y15×3",           "先知PPT", 15, 3, True,  None, None),
-    ("PPT-y20×3",           "先知PPT", 20, 3, True,  None, None),
-    ("PPT-y15×3+前日涨5%弃",  "先知PPT", 15, 3, True,  None, 0.05),
-    ("PPT-y20×3+前日涨5%弃",  "先知PPT", 20, 3, True,  None, 0.05),
+    (f"拐点-y{y}×{mpd}", "拐点", y, mpd, True, None, None)
+    for y in (1, 3, 5, 7, 8, 10, 12, 15)
+    for mpd in (1, 3)
 ]
 
 
