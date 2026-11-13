@@ -470,7 +470,8 @@ def _pct_cell(v):
 
 def style_holdings(df: pd.DataFrame):
     """对已重命名为中文列名的表着色:红涨绿跌,百分比格式。"""
-    pct_cols = [c for c in df.columns if c in ("当日收益率", "累计收益")]
+    pct_cols = [c for c in df.columns
+                if c in ("开盘涨幅", "实体涨幅", "收盘涨幅", "当日收益率", "累计收益")]
     fmt = {c: "{:.2%}" for c in pct_cols}
     if "仓位占比" in df.columns:
         fmt["仓位占比"] = "{:.1%}"
@@ -869,12 +870,15 @@ else:
             if day_df.empty:
                 st.info(f"{sel_date} 当日无交易、无持仓")
             else:
-                show = day_df[["name", "code", "action", "weight", "day_return",
+                show = day_df[["name", "code", "action", "weight", "open_ret",
+                               "body_ret", "close_ret", "day_return",
                                "cum_return", "rec_date", "entry_date", "trade_days"]].copy()
                 show["操作"] = show["action"].map({"buy": "买入", "sell": "卖出", "hold": "持有"})
-                show = show[["name", "code", "操作", "weight", "day_return", "cum_return",
+                show = show[["name", "code", "操作", "weight", "open_ret", "body_ret",
+                             "close_ret", "day_return", "cum_return",
                              "rec_date", "entry_date", "trade_days"]]
-                show.columns = ["股票名称", "代码", "操作", "仓位占比", "当日收益率",
+                show.columns = ["股票名称", "代码", "操作", "仓位占比", "开盘涨幅",
+                                "实体涨幅", "收盘涨幅", "当日收益率",
                                 "累计收益", "推荐日期", "买入日期", "交易天数"]
                 order = {"卖出": 0, "买入": 1, "持有": 2}
                 show = show.sort_values(

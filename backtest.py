@@ -106,10 +106,10 @@ def run_backtest(recs: pd.DataFrame, market: pd.DataFrame, trade_dates: list[str
                     # 停牌无法成交:保留持仓,规则下个交易日自然重发(与买入跳过同口径,
                     # RULES.md:顺延到下一个有行情的交易日按开盘执行)
                     continue
-                if act.op == "sell_open":
-                    r = gap_return(bar["open"], bar["pre_close"])
-                else:
-                    r = daily_return(bar["pct_chg"])
+                g = gap_return(bar["open"], bar["pre_close"])
+                b = body_return(bar["open"], bar["close"])
+                c = daily_return(bar["pct_chg"])
+                r = g if act.op == "sell_open" else c
                 trade_day_count[act.pos] = trade_day_count.get(act.pos, 0) + 1
                 last_bar_date[act.pos] = date
                 if fee is not None:
@@ -119,6 +119,7 @@ def run_backtest(recs: pd.DataFrame, market: pd.DataFrame, trade_dates: list[str
                     h = h._replace(cum_return=round((1 + (h.cum_return or 0)) * (1 + r) - 1, 6))
                 holding_rows.append(_hold_row(date, act.pos, h, entry_info, weight=0.0,
                                               day_return=r, action="sell",
+                                              gap_ret=g, body_ret=b, close_ret=c,
                                               trade_days=trade_day_count.get(act.pos, 0)))
                 last_cum[act.pos] = h.cum_return
                 del holdings[act.pos]
@@ -149,18 +150,25 @@ def run_backtest(recs: pd.DataFrame, market: pd.DataFrame, trade_dates: list[str
                 fee_day += (1.0 / n_after) * rate
 
         # 3. 当日各持仓收益:day_returns 用于累计收益连乘(entry 当日实体、之后全日涨跌);
-        #    body_returns 为展示/账户因子口径(实体涨幅);无 bar(停牌)→ None
+        #    body_returns 为展示/账户因子口径(实体涨幅);无 bar(停牌)→ None;
+        #    gap/close/body 三字典为持仓明细展示列(开盘/收盘/实体涨幅)
         day_returns = {}
         body_returns = {}
+        gap_returns = {}
+        close_returns = {}
         weights = {}
         for pos, h in holdings.items():
             bar = day_bars.get(h.code)
             if bar is None:
                 day_returns[pos] = None
                 body_returns[pos] = None
+                gap_returns[pos] = None
+                close_returns[pos] = None
             else:
                 body = body_return(bar["open"], bar["close"])
                 body_returns[pos] = body
+                gap_returns[pos] = gap_return(bar["open"], bar["pre_close"])
+                close_returns[pos] = daily_return(bar["pct_chg"])
                 if h.entry_date == date:
                     day_returns[pos] = body
                     trade_day_count[pos] = 1
@@ -214,6 +222,9 @@ def run_backtest(recs: pd.DataFrame, market: pd.DataFrame, trade_dates: list[str
             holding_rows.append(_hold_row(date, pos, h, entry_info, weight=w,
                                           day_return=(body_returns.get(pos) if is_entry
                                                       else day_returns.get(pos)),
+                                          gap_ret=gap_returns.get(pos),
+                                          body_ret=body_returns.get(pos),
+                                          close_ret=close_returns.get(pos),
                                           action="buy" if is_entry else "hold",
                                           trade_days=trade_day_count.get(pos, 0)))
 
@@ -249,19 +260,24 @@ def run_backtest(recs: pd.DataFrame, market: pd.DataFrame, trade_dates: list[str
 
     daily_holdings = pd.DataFrame(holding_rows,
                                   columns=["date", "code", "name", "action", "rec_date",
-                                           "entry_date", "weight", "day_return", "cum_return",
+                                           "entry_date", "weight", "open_ret", "body_ret",
+                                           "close_ret", "day_return", "cum_return",
                                            "trade_days", "pos"])
     portfolio_daily = pd.DataFrame(portfolio_rows)
     rec_summary = pd.DataFrame(rec_summary_rows)
     return daily_holdings, portfolio_daily, rec_summary
 
 
-def _hold_row(date, pos, h, entry_info, weight, day_return, trade_days, action):
+def _hold_row(date, pos, h, entry_info, weight, day_return, trade_days, action,
+              gap_ret=None, body_ret=None, close_ret=None):
+    """单日持仓明细行。gap/body/close 为该股当日 开盘/实体/收盘 涨幅(展示列,
+    与操作无关;停牌无 bar → None)。"""
     entry_date, rec_date, name = entry_info.get(pos, (h.entry_date, None, h.code))
     return {
         "date": date, "code": h.code, "name": name, "action": action,
         "rec_date": rec_date, "entry_date": entry_date,
         "weight": weight,
+        "open_ret": gap_ret, "body_ret": body_ret, "close_ret": close_ret,
         "day_return": day_return, "cum_return": h.cum_return,
         "trade_days": trade_days, "pos": pos,
     }
