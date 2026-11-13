@@ -323,6 +323,22 @@ def main():
     off = per_start[(per_start['op'] == 'B') & (~per_start['code'].isin(pool6))] if len(per_start) else per_start
     off_amt = float((off['qty'] * off['price']).sum()) if len(off) else 0.0
     cur = cv.iloc[-1]
+    # 回撤监控: 手动底线(距峰值 -20% 无条件切防守)。基准取计划期(START 起)峰值——
+    # 全历史峰值(-153万, 05-19)属于旧模式, 拿它做闸会永远报警失去意义
+    peak_all = cv.loc[cv['equity_pnl'].idxmax()]
+    plan_cv = cv[cv['date'] >= START]
+    dd_lines = None
+    if len(plan_cv):
+        pk = plan_cv.loc[plan_cv['equity_pnl'].idxmax()]
+        if pk['equity_pnl'] > 0:
+            dd = cur['equity_pnl'] / pk['equity_pnl'] - 1
+            dd_lines = [f'- 计划期峰值: {pk["date"]} {pk["equity_pnl"]:+,.0f} 元 → 当前 {cur["equity_pnl"]:+,.0f} 元,距峰值 **{dd:+.1%}**']
+            if dd <= -0.20:
+                dd_lines.append('- **🚨 已触发手动底线(回撤 ≥20%):按纪律无条件全部切防守、空仓一个月再回来,无视任何信号**')
+            elif dd <= -0.15:
+                dd_lines.append('- ⚠️ 回撤已过 15% 预警线,降仓位')
+            else:
+                dd_lines.append(f'- 未触及预警线(15%)/手动底线(20%);全历史峰值 {peak_all["date"]} {peak_all["equity_pnl"]:+,.0f} 元(旧模式,仅作对照)')
 
     def w(v): return f'{v:+,.0f}'
     lines = ['# 月度对照: 实际账户 vs 项目回测(攻防转换)', '',
@@ -334,8 +350,10 @@ def main():
         lines.append(f'| {r["ym"]} | {w(r["act_pnl"])} | {r["act_ret"]:+.2%} | {r["bt_ret"]:+.2%} | {w(r["bt_pnl"])} | {w(r["diff"])} |')
     tot_act = sum(r['act_pnl'] for r in rows_tbl)
     tot_bt = sum(r['bt_pnl'] for r in rows_tbl)
-    lines += ['', f'**期间合计: 实际 {w(tot_act)} 元 / 回测 {w(tot_bt)} 元 / 差额 {w(tot_act - tot_bt)} 元**', '',
-              '## 执行检查(起始日起)', '',
+    lines += ['', f'**期间合计: 实际 {w(tot_act)} 元 / 回测 {w(tot_bt)} 元 / 差额 {w(tot_act - tot_bt)} 元**']
+    if dd_lines:
+        lines += ['', '## 回撤监控(手动底线:距峰值 -20% 无条件切防守)', ''] + dd_lines
+    lines += ['', '## 执行检查(起始日起)', '',
               f'- 交易笔数: {len(per_start)} 笔(做T 频率应趋近 0)',
               f'- 池外买入: {len(off)} 笔 / {off_amt:,.0f} 元(目标 0)',
               f'- 短线平仓(<=3天): {len(tp)} 笔 / {tp["pnl"].sum() if len(tp) else 0:+,.0f} 元(目标 0)',
@@ -346,6 +364,8 @@ def main():
     with open(OUT, 'w', encoding='utf-8') as f:
         f.write('\n'.join(lines))
     print('\n'.join(lines))
+    if dd_lines and any('🚨' in l for l in dd_lines):
+        print('\a🚨 回撤已触发 20% 手动底线!')
     print('WROTE', OUT)
 
 if __name__ == '__main__':
