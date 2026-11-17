@@ -12,6 +12,9 @@
   即 pct_chg/100,与累计收益连乘口径一致)、卖出=开盘涨跌幅;
   账户收益第二因子不受展示口径影响,仍为实体涨幅
 - 手续费(fee 参数,费率见 config.py)按成交金额计,从当日净值扣减
+- 加权仓位模式:规则 action 声明 weight(非 None,如限仓轮换的"每只 N 成")时,
+  账户收益与手续费按真实成数加权,未持仓部分为空仓现金(不计收益),持仓明细
+  「weight」列显示声明成数(不归一化);weight 全部为 None 时维持原等权满仓口径
 - 停牌日(当日无行情)买卖动作一律跳过:持仓保留,规则下个交易日自然重发
 - 同一推荐卖出后再次买入(如防守 ETF 被攻防切换卖出后又买回)= 新一轮:
   进场日期/交易天数/累计收益按新一轮起算,entry_info 记录最新一轮
@@ -84,6 +87,7 @@ def run_backtest(recs: pd.DataFrame, market: pd.DataFrame, trade_dates: list[str
     last_cum = {}          # pos -> 最后 cum_return
 
     prev_codes = {}        # 上一交易日收盘持仓 pos -> ts_code(账户收益第一因子输入)
+    prev_weights = {}      # 上一交易日收盘持仓 pos -> weight(None=等权满仓口径)
     nav = 1.0
     peak_nav = 1.0
 
@@ -114,7 +118,8 @@ def run_backtest(recs: pd.DataFrame, market: pd.DataFrame, trade_dates: list[str
                 last_bar_date[act.pos] = date
                 if fee is not None:
                     rate = fee["etf_sell"] if is_etf(h.code) else fee["stock_sell"]
-                    fee_day += (1.0 / n_before) * rate
+                    w_trade = float(h.weight) if h.weight is not None else 1.0 / n_before
+                    fee_day += w_trade * rate
                 if r is not None:
                     h = h._replace(cum_return=round((1 + (h.cum_return or 0)) * (1 + r) - 1, 6))
                 holding_rows.append(_hold_row(date, act.pos, h, entry_info, weight=0.0,
@@ -125,7 +130,7 @@ def run_backtest(recs: pd.DataFrame, market: pd.DataFrame, trade_dates: list[str
                 del holdings[act.pos]
 
         # 2. 买入:按当日开盘;当日无 bar(停牌)则跳过,规则下个交易日自然重发
-        bought_codes = []
+        bought = []   # (ts_code, weight);weight 非 None 按声明成数计费,None 按等权满仓近似
         for act in actions:
             if act.op != "buy" or act.pos in holdings:
                 continue
@@ -142,12 +147,13 @@ def run_backtest(recs: pd.DataFrame, market: pd.DataFrame, trade_dates: list[str
                                         weight=act.weight, cum_return=None)
             trade_day_count[act.pos] = 1
             last_bar_date[act.pos] = date
-            bought_codes.append(info["ts_code"])
-        if fee is not None and bought_codes:
+            bought.append((info["ts_code"], act.weight))
+        if fee is not None and bought:
             n_after = max(len(holdings), 1)
-            for code in bought_codes:
+            for code, w in bought:
                 rate = fee["etf_buy"] if is_etf(code) else fee["stock_buy"]
-                fee_day += (1.0 / n_after) * rate
+                w_trade = float(w) if w is not None else 1.0 / n_after
+                fee_day += w_trade * rate
 
         # 3. 当日各持仓收益:day_returns 用于累计收益连乘(entry 当日实体、之后全日涨跌);
         #    body_returns 为展示/账户因子口径(实体涨幅);无 bar(停牌)→ None;
@@ -187,17 +193,36 @@ def run_backtest(recs: pd.DataFrame, market: pd.DataFrame, trade_dates: list[str
 
         # 5. 当日账户收益率 = (1+上一交易日持仓今日平均开盘涨跌幅)×(1+今日收盘持仓平均实体涨幅)-1
         #    (等权;停牌不进平均;空集合因子记 1;口径见 RULES.md「当日账户收益率」)
-        gaps = []
-        for code in prev_codes.values():
-            bar = day_bars.get(code)
-            if bar is not None:
-                g = gap_return(bar["open"], bar["pre_close"])
-                if g is not None:
-                    gaps.append(g)
-        bodies = [b for b in body_returns.values() if b is not None]
-        avg_gap = round(sum(gaps) / len(gaps), 6) if gaps else 0.0
-        avg_body = round(sum(bodies) / len(bodies), 6) if bodies else 0.0
-        account_return = round((1 + avg_gap) * (1 + avg_body) - 1, 6)
+        #    加权仓位模式(规则声明 weight,如限仓轮换):按真实成数加权求和,其余资金
+        #    为空仓现金(不计收益);等权满仓模式(weight 全 None)维持原两因子平均口径
+        weighted_mode = (any(w is not None for w in prev_weights.values())
+                         or any(h.weight is not None for h in holdings.values()))
+        if weighted_mode:
+            w_gap = 0.0
+            for pos, code in prev_codes.items():
+                bar = day_bars.get(code)
+                if bar is not None:
+                    g = gap_return(bar["open"], bar["pre_close"])
+                    if g is not None:
+                        w_gap += (float(prev_weights.get(pos)) or 0.0) * g
+            w_body = 0.0
+            for pos, h in holdings.items():
+                b = body_returns.get(pos)
+                if b is not None:
+                    w_body += (float(h.weight) if h.weight is not None else 0.0) * b
+            account_return = round((1 + w_gap) * (1 + w_body) - 1, 6)
+        else:
+            gaps = []
+            for code in prev_codes.values():
+                bar = day_bars.get(code)
+                if bar is not None:
+                    g = gap_return(bar["open"], bar["pre_close"])
+                    if g is not None:
+                        gaps.append(g)
+            bodies = [b for b in body_returns.values() if b is not None]
+            avg_gap = round(sum(gaps) / len(gaps), 6) if gaps else 0.0
+            avg_body = round(sum(bodies) / len(bodies), 6) if bodies else 0.0
+            account_return = round((1 + avg_gap) * (1 + avg_body) - 1, 6)
 
         # 组合净值:账户收益率 - 当日手续费拖累
         net = account_return - fee_day
@@ -215,9 +240,13 @@ def run_backtest(recs: pd.DataFrame, market: pd.DataFrame, trade_dates: list[str
         # 6. 当日持仓明细行(操作=买入/持有;weight 为归一化仓位占比)
         #    展示口径:买入=实体涨幅;持有=全天涨跌幅(收盘/昨收-1,即 day_returns
         #    的 pct_chg/100,与累计收益连乘口径一致);卖出=开盘涨跌幅(见步骤 1)
+        #    加权仓位模式:weight 列 = 声明成数(其余为现金,不归一化)
         w_sum = sum(weights.values())
         for pos, h in holdings.items():
-            w = weights.get(pos, 1.0) / w_sum if w_sum else None
+            if weighted_mode:
+                w = weights.get(pos)
+            else:
+                w = weights.get(pos, 1.0) / w_sum if w_sum else None
             is_entry = h.entry_date == date
             holding_rows.append(_hold_row(date, pos, h, entry_info, weight=w,
                                           day_return=(body_returns.get(pos) if is_entry
@@ -230,6 +259,7 @@ def run_backtest(recs: pd.DataFrame, market: pd.DataFrame, trade_dates: list[str
 
         # 记录收盘持仓,供次日账户收益第一因子使用
         prev_codes = {pos: h.code for pos, h in holdings.items()}
+        prev_weights = {pos: h.weight for pos, h in holdings.items()}
 
     # 循环结束:仍持有的股票记录最终累计收益
     for pos, h in holdings.items():

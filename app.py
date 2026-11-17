@@ -16,8 +16,9 @@ import data_fetcher as fetcher
 import backtest
 from config import (TS_TOKEN, DB_PATH, INPUT_DIR, OUTPUT_DIR, EXCEL_COLUMNS,
                     REGIME_FILE_NAME, DEFAULT_INPUT_FILE, BENCHMARKS, BENCHMARK_COMBO)
-from indicators import benchmark_navs
-from rules import make_hold_n_days, make_regime_rule, prev_gain_discard, target_keys
+from indicators import benchmark_navs, body_return, daily_return
+from rules import (make_fixed_hold_rule, make_hold_n_days, make_regime_rule,
+                   make_slot_rule, prev_gain_discard, slot_capacity, target_keys)
 
 st.set_page_config(page_title="股票推荐回测", layout="wide",
                    initial_sidebar_state="expanded")
@@ -32,6 +33,11 @@ MARKER = "#888888"     # 日期推进虚线
 GRID = "rgba(0,0,0,0.08)"
 GREEN_FILL = "rgba(46,125,50,0.25)"
 BENCH_COLORS = ["#E65100", "#6A1B9A", "#2E7D32", "#B71C1C", "#00838F"]  # 基准曲线配色
+
+# ====================== 回测算法(侧边栏可切换) ======================
+ALGO_REGIME = "攻防转换"          # 仓位表攻防切换,持最近 y/z 条推荐(参数在 config.py)
+ALGO_FIXED = "固定持有N日等权"     # 推荐起始日开盘买入,持有 N 个交易日,第 N+1 日开盘卖出,每日等权
+ALGO_SLOT = "限仓轮换"            # 每只固定 W 成仓位(其余现金),FIFO 新老替换,持有 D 个交易日到期全卖
 
 
 def _ensure_dirs():
@@ -138,7 +144,15 @@ def _strategy_params():
 
     不用模块顶部 from-import:Python 缓存模块,页面重跑只会拿到旧值。
     config.py 是纯数据文件,reload 无副作用。token/路径变更仍需重启。
+    防御:长时间运行的 server 进程多次热重载后,命名空间里的 config 可能是
+    __spec__ 丢失的旧模块对象(实测 reload 报 "module config not in
+    sys.modules"),先按名重取;sys.modules 条目同样损坏时强制重导。
     """
+    import config
+    if getattr(config, "__spec__", None) is None:
+        import sys
+        sys.modules.pop("config", None)
+        import config
     importlib.reload(config)
     return (config.X_THRESHOLD, config.Y_OFFENSE, config.Z_DEFENSE,
             config.FEE, config.OPEN_GAP_SKIP, config.PREV_DAY_GAIN_SKIP,
@@ -191,20 +205,39 @@ def _load_benchmarks(db_key: str, bench_ver: int, codes: tuple) -> pd.DataFrame:
 
 
 def _engine_stamp() -> str:
-    """引擎源码 mtime 指纹:backtest/rules/indicators 代码一改,缓存 key 随之变化,
-    避免输入文件没变时页面继续用旧口径的回测结果(如改 bug 后买入日期仍旧值)。"""
+    """引擎源码 mtime 指纹:backtest/rules/indicators/app 代码一改,缓存 key 随之变化,
+    避免输入文件没变时页面继续用旧口径的回测结果(如改 bug 后买入日期仍旧值)。
+    app.py 也计入:_build_rule_and_recs 在 app.py 里,规则构造口径变了同样要重算。"""
     root = Path(__file__).parent
     return ";".join(f"{name}:{int((root / name).stat().st_mtime)}"
-                    for name in ("backtest.py", "rules.py", "indicators.py"))
+                    for name in ("backtest.py", "rules.py", "indicators.py",
+                                 "app.py"))
 
 
 # 策略参数作为 _run_backtest 签名的一部分:参数值变化 → 缓存自动失效重算
 def _build_rule_and_recs(recs_tuple: tuple, regime_key, x: float, y: int, z: int,
                          gap: float | None = None, prev_gain: float | None = None,
-                         mpd: int | None = None, limit_fill: bool = False):
-    """推荐元组 + 仓位/防守状态 → (并入防守行的 recs_all, 规则实例)。每次调用新建规则。"""
+                         mpd: int | None = None, limit_fill: bool = False,
+                         algo: str = ALGO_REGIME, hold_days: int = 5,
+                         slot_w: float = 0.1, slot_d: int = 10):
+    """推荐元组 + 仓位/防守状态 → (并入防守行的 recs_all, 规则实例)。每次调用新建规则。
+
+    algo=ALGO_FIXED 时只用 Excel 推荐池(防守列表与攻防过滤参数不适用),
+    规则为固定持有 N 日等权(见 rules.make_fixed_hold_rule)。
+    algo=ALGO_SLOT 时同日同股合并(名称+推荐日期相同只占一个仓位)后,
+    规则为限仓轮换(见 rules.make_slot_rule):每只 slot_w 成、FIFO 新老替换、
+    持有 slot_d 个交易日后到期全卖;引擎按真实成数加权计净值,其余资金为现金。
+    """
     recs = pd.DataFrame(list(recs_tuple),
                         columns=["ts_code", "name", "start_date"])
+    if algo == ALGO_FIXED:
+        return recs, make_fixed_hold_rule(int(hold_days))
+    if algo == ALGO_SLOT:
+        # 同日同股合并:名称+推荐日期相同的多行只占一个仓位(保留首行)
+        recs = recs.drop_duplicates(subset=["ts_code", "start_date"],
+                                    keep="first").reset_index(drop=True)
+        # slot_w 已是小数成数(0.1 = 1 成,调用方从页面"成"换算),直接进规则/引擎
+        return recs, make_slot_rule(float(slot_w), int(slot_d))
     if regime_key is None:
         return recs, make_hold_n_days(10)  # 仓位/防守文件缺失时的退回规则
     regime, defense = regime_key
@@ -230,9 +263,11 @@ def _run_engine(recs_all, rule, db_key: str, version: int, fee: dict):
 def _run_backtest(recs_tuple: tuple, regime_key, db_key: str, version: int,
                   x: float, y: int, z: int, gap: float | None,
                   prev_gain: float | None, mpd: int | None, limit_fill: bool,
-                  fee: dict, engine_ver: str = ""):
+                  fee: dict, algo: str = ALGO_REGIME, hold_days: int = 5,
+                  slot_w: float = 0.1, slot_d: int = 10, engine_ver: str = ""):
     recs_all, rule = _build_rule_and_recs(recs_tuple, regime_key, x, y, z, gap,
-                                          prev_gain, mpd, limit_fill)
+                                          prev_gain, mpd, limit_fill,
+                                          algo, hold_days, slot_w, slot_d)
     return _run_engine(recs_all, rule, db_key, version, fee)
 
 
@@ -630,6 +665,106 @@ def _date_nav(prefix: str, dates: list[str], label: str,
     return sel, start_str, end_str
 
 
+# ====================== 买入持有收益阶梯(导出用,与算法无关) ======================
+def _hold_ladder_rows(merged: pd.DataFrame, market: pd.DataFrame):
+    """逐条推荐产出 (ts_code, name, start_date, seq),seq = [(trade_date, 当日涨幅, 累计涨幅), ...]。
+
+    口径:首日 = 起始日期(停牌顺延到首个有行情交易日,即实际买入日)的**实体涨幅**
+    (收盘/开盘-1);其后每个**有行情交易日** = **收盘涨幅**(pct_chg/100,停牌日跳过);
+    累计 = 自买入日开盘持有到当日收盘的复利涨幅 = (1+首日)×(1+次日)×...-1。
+    一直持有不卖,与任何算法无关。缺数据日跳过、不计入持有天数。
+    """
+    m = market[market["ts_code"].isin(set(merged["ts_code"]))].sort_values("trade_date")
+    by_code = {c: g for c, g in m.groupby("ts_code")}
+    for _, r in merged.iterrows():
+        bars = by_code.get(r["ts_code"])
+        bars = bars[bars["trade_date"] >= r["start_date"]] if bars is not None else None
+        seq, cum, started = [], None, False
+        if bars is not None and not bars.empty:
+            for _, b in bars.iterrows():
+                d = (body_return(b["open"], b["close"]) if not started
+                     else daily_return(b["pct_chg"]))
+                if d is None:
+                    continue            # 缺数据日跳过,不计入持有天数
+                started = True
+                cum = round((1 + (cum or 0)) * (1 + d) - 1, 6)
+                seq.append((b["trade_date"], d, cum))
+        yield (r["ts_code"], r["name"], r["start_date"], seq)
+
+
+def _build_hold_ladder(recs: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
+    """sheet「收益阶梯」:每条(股票, 起始日期)一行,股票代码/股票名称/起始日期 +
+    day1/累计day1/day2/累计day2/... 直至最新行情(列数 = 最长阶梯,不足留空)。
+    同日同股合并为一行(与限仓轮换算法同口径,保留首行名称)。"""
+    merged = recs.drop_duplicates(subset=["ts_code", "start_date"],
+                                  keep="first").reset_index(drop=True)
+    rows, max_days = [], 0
+    for code, name, sd, seq in _hold_ladder_rows(merged, market):
+        row = {"股票代码": code, "股票名称": name, "起始日期": sd}
+        for n, (_d, ret, cum) in enumerate(seq, 1):
+            row[f"day{n}"] = ret
+            row[f"累计day{n}"] = cum
+        max_days = max(max_days, len(seq))
+        rows.append(row)
+    cols = (["股票代码", "股票名称", "起始日期"]
+            + [c for n in range(1, max_days + 1)
+               for c in (f"day{n}", f"累计day{n}")])
+    return pd.DataFrame(rows, columns=cols)
+
+
+def _build_hold_date_matrix(recs: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
+    """sheet「按日期对齐」:每行一只股票(行序与「收益阶梯」sheet 一致),
+    前 3 列 = 股票代码/股票名称/起始日期,其后列 = 池内最早起始日期起的每个交易日,
+    成对 (YYYYMMDD, YYYYMMDD累计):当日该股在自身阶梯上的涨幅(买入日=实体涨幅,
+    其后=收盘涨幅)与截至当日收盘的累计涨幅;未到买入日/停牌/已无行情的格子留空。"""
+    merged = recs.drop_duplicates(subset=["ts_code", "start_date"],
+                                  keep="first").reset_index(drop=True)
+    seqs = [(code, name, sd, dict((d, (ret, cum)) for d, ret, cum in seq))
+            for code, name, sd, seq in _hold_ladder_rows(merged, market)]
+    min_sd = merged["start_date"].min()
+    dates = sorted(market[market["trade_date"] >= min_sd]["trade_date"].unique())
+    cols = (["股票代码", "股票名称", "起始日期"]
+            + [c for d in dates
+               for c in (d.replace("-", ""), d.replace("-", "") + "累计")])
+    if len(cols) == 3:
+        return pd.DataFrame([{"提示": "池内最早起始日期晚于最新行情,无数据"}])
+    rows = []
+    for code, name, sd, m in seqs:
+        row = {"股票代码": code, "股票名称": name, "起始日期": sd}
+        for d, (ret, cum) in m.items():
+            key = d.replace("-", "")
+            row[key] = ret
+            row[key + "累计"] = cum
+        rows.append(row)
+    return pd.DataFrame(rows, columns=cols)
+
+
+def _style_ret_sheet(ws, start_col: int, freeze: str, bold_last_row: bool):
+    """收益 sheet 通用样式:收益率列百分比格式;>1% 浅红底、<-1% 浅绿底、
+    −1%~1% 灰底,一律黑字(浅底配黑字反差,红涨绿跌);可选末行(平均收益率行)加粗;冻结窗格。"""
+    from openpyxl.styles import Font, PatternFill
+    fill_red = PatternFill("solid", fgColor="FFE6E6")    # 浅红(与页面表格同色)
+    fill_green = PatternFill("solid", fgColor="E6FFE6")  # 浅绿(与页面表格同色)
+    fill_gray = PatternFill("solid", fgColor="808080")
+    last_row = ws.max_row
+    for col in ws.iter_cols(min_col=start_col):
+        for cell in col:
+            if not isinstance(cell.value, (int, float)):
+                continue
+            cell.number_format = "0.00%"
+            if cell.value > 0.01:
+                cell.fill = fill_red
+            elif cell.value < -0.01:
+                cell.fill = fill_green
+            else:
+                cell.fill = fill_gray
+            cell.font = Font(color="000000",
+                             bold=bold_last_row and cell.row == last_row)
+    if bold_last_row:
+        ws.cell(row=last_row, column=1).font = Font(bold=True)
+    ws.freeze_panes = freeze
+
+
 # ====================== 主流程 ======================
 _ensure_dirs()
 fetcher.init_db()
@@ -637,6 +772,29 @@ fetcher.init_db()
 st.title("📊 股票推荐回测")
 
 # ---------- 侧边栏 ----------
+def _next_plan_date(recs: pd.DataFrame) -> tuple[str | None, str | None]:
+    """(last_closed, plan_date):最后一个已收盘交易日(15:00 后含今日)的下一交易日。
+
+    日历自动补拉未来两周(失败则用库里已有日历,缺未来日期由调用方提示);
+    plan_date 为 None 表示日历未覆盖下一交易日。
+    """
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    try:
+        fetcher.ensure_trade_calendar(
+            recs["start_date"].min(),
+            (now + timedelta(days=14)).strftime("%Y-%m-%d"))
+    except Exception:
+        pass  # 日历补拉失败时先用库里已有的日历,缺未来日期则下方提示
+    tds_all = fetcher.load_trade_dates()   # 直查 DB(含未来日期),不走缓存
+    closed = [d for d in tds_all if d < today]
+    if today in tds_all and now.hour >= 15:
+        closed.append(today)               # 今天已过 15:00 收盘
+    last_closed = max(closed) if closed else None
+    after = [d for d in tds_all if last_closed and d > last_closed]
+    return last_closed, (after[0] if after else None)
+
+
 def _trade_plan(plan_date: str, last_closed: str, recs: pd.DataFrame,
                 regime_data: dict, daily_holdings: pd.DataFrame,
                 x: float, y: int, z: int, bars_by_date: dict,
@@ -650,10 +808,12 @@ def _trade_plan(plan_date: str, last_closed: str, recs: pd.DataFrame,
     (sell/buy/hold 为 pos 集合;lookup 元组 (pos, ts_code, name, start_date))
     """
     def _pos_of(d):
+        # 区间重叠时行序靠后者覆盖靠前者(与 rules.regime_position 同口径)
+        hit = None
         for s, e, p in regime_data["regime"]:
             if s <= d <= e:
-                return p
-        return None
+                hit = p
+        return hit
     pos_plan = _pos_of(plan_date)
     inherited = pos_plan is None
     if inherited:
@@ -719,6 +879,90 @@ def _trade_plan(plan_date: str, last_closed: str, recs: pd.DataFrame,
             "notes": notes}
 
 
+def _trade_plan_fixed(plan_date: str, last_closed: str, recs: pd.DataFrame,
+                      daily_holdings: pd.DataFrame, hold_days: int) -> dict:
+    """固定持有N日等权规则的计划:计划日开盘买新推荐、卖满 N+1 个交易日的持仓。
+
+    与回测完全同源(rules.make_fixed_hold_rule):持仓与已卖集合直接取回测
+    daily_holdings 的最后交易日状态;买入 = 起始日期 <= 计划日且未持有未卖出
+    的推荐(停牌未买成的规则自然重发);卖出 = 已持有交易日数(trade_days,
+    含买入日、停牌日不计)>= N 的持仓(计划日即第 N+1 个交易日开盘卖;
+    计划日停牌则实盘顺延,与引擎口径一致)。等权,权重由引擎归一化。
+    """
+    if daily_holdings.empty:
+        return {"cur_date": None, "cur": {}, "buys": [], "sells": [],
+                "holds": [], "notes": ["暂无回测数据,点侧边栏「初始化/更新行情数据」"]}
+    cur_date = daily_holdings["date"].max()
+    cur_rows = daily_holdings[daily_holdings["date"] == cur_date]
+    cur = {int(r["pos"]): {"ts_code": r["code"], "name": r["name"],
+                           "entry_date": r["entry_date"], "rec_date": r["rec_date"],
+                           "trade_days": int(r["trade_days"] or 0)}
+           for _, r in cur_rows[cur_rows["action"] != "sell"].iterrows()}
+    sold = {int(p) for p in daily_holdings.loc[
+        daily_holdings["action"] == "sell", "pos"].dropna()}
+    buys = [(i, r.ts_code, r.name, r.start_date)
+            for i, r in enumerate(recs.itertuples())
+            if r.start_date <= plan_date and i not in cur and i not in sold]
+    sells = [p for p in cur if cur[p]["trade_days"] >= hold_days]
+    holds = [p for p in cur if p not in sells]
+    notes = []
+    if cur_date < last_closed:
+        notes.append(f"最新行情只到 {cur_date},当前持仓按该日收盘计算"
+                     f"(点「初始化/更新行情数据」刷新)")
+    if not buys and not sells and cur:
+        notes.append(f"{plan_date} 无新增推荐、无到期持仓,维持当前 {len(cur)} 只持仓不动")
+    return {"cur_date": cur_date, "cur": cur, "sold": sold, "buys": buys,
+            "sells": sells, "holds": holds, "notes": notes}
+
+
+def _trade_plan_slot(plan_date: str, last_closed: str, recs: pd.DataFrame,
+                     daily_holdings: pd.DataFrame, weight_cheng: float,
+                     hold_days: int) -> dict:
+    """限仓轮换规则的计划:计划日开盘买目标集内新推荐、卖被挤出的最老仓与到期仓。
+
+    与回测完全同源(rules.make_slot_rule):同日同股先合并(与 _build_rule_and_recs
+    一致);目标 = 未卖出推荐中最新 floor(满仓/每只成数) 只;持仓与已卖集合取回测
+    daily_holdings 最后交易日状态。卖出两类:不在目标集(被新推荐 FIFO 挤出)或
+    已持有交易日数(trade_days,含买入日,停牌日不计)>= D(计划日即第 D+1 个交易日
+    到期)。weight_cheng 为"成"(1.0 = 10%),与规则/引擎的小数口径 ÷10 换算。
+    等计划日停牌则实盘顺延,与引擎口径一致。
+    """
+    merged = recs.drop_duplicates(subset=["ts_code", "start_date"],
+                                  keep="first").reset_index(drop=True)
+    if daily_holdings.empty:
+        return {"cur_date": None, "cur": {}, "buys": [], "sells": [],
+                "holds": [], "notes": ["暂无回测数据,点侧边栏「初始化/更新行情数据」"]}
+    cur_date = daily_holdings["date"].max()
+    cur_rows = daily_holdings[daily_holdings["date"] == cur_date]
+    cur = {int(r["pos"]): {"ts_code": r["code"], "name": r["name"],
+                           "entry_date": r["entry_date"], "rec_date": r["rec_date"],
+                           "trade_days": int(r["trade_days"] or 0)}
+           for _, r in cur_rows[cur_rows["action"] != "sell"].iterrows()}
+    sold = {int(p) for p in daily_holdings.loc[
+        daily_holdings["action"] == "sell", "pos"].dropna()}
+    alive = [(i, r.ts_code, r.name, r.start_date)
+             for i, r in enumerate(merged.itertuples())
+             if r.start_date <= plan_date and i not in sold]
+    capacity = slot_capacity(weight_cheng / 10.0)
+    newest_first = sorted(alive, key=lambda r: (r[3], -r[0]), reverse=True)
+    target = {r[0] for r in newest_first[:capacity]}
+    buys = [(p, ts, name, sd) for p, ts, name, sd in alive
+            if p in target and p not in cur]
+    sells = [p for p in cur if p not in target
+             or cur[p]["trade_days"] >= hold_days]
+    holds = [p for p in cur if p not in sells]
+    notes = []
+    if cur_date < last_closed:
+        notes.append(f"最新行情只到 {cur_date},当前持仓按该日收盘计算"
+                     f"(点「初始化/更新行情数据」刷新)")
+    if not buys and not sells and cur:
+        notes.append(f"{plan_date} 无新增推荐、无到期/被替换持仓,"
+                     f"维持当前 {len(cur)} 只持仓不动")
+    return {"cur_date": cur_date, "cur": cur, "sold": sold, "buys": buys,
+            "sells": sells, "holds": holds, "capacity": capacity,
+            "notes": notes}
+
+
 def parse_into_state(path):
     """按文件修改时间缓存解析结果,避免每次交互都重读 Excel。"""
     mkey = f"{path.name}:{path.stat().st_mtime_ns}"
@@ -764,15 +1008,66 @@ with st.sidebar:
 
     recs = st.session_state.get("recs")
 
-    # 仓位/防守文件(RULES.md):固定读 input/ 下配置名,改文件后自动重解析
+    # 回测算法(选择持久化到 ui_prefs,刷新页面后保留)
+    st.markdown("### ② 回测算法")
+    if "algo" not in st.session_state:
+        st.session_state.algo = _load_ui_prefs().get("algo", ALGO_REGIME)
+
+    def _save_algo():
+        _save_ui_pref("algo", st.session_state.algo)
+
+    st.selectbox("收益率算法", [ALGO_REGIME, ALGO_FIXED, ALGO_SLOT], key="algo",
+                 on_change=_save_algo,
+                 help=f"{ALGO_REGIME}:按仓位表攻防切换,持最近 y/z 条推荐(参数在 config.py);"
+                      f"{ALGO_FIXED}:推荐起始日开盘买入、持有 N 个交易日、"
+                      f"第 N+1 个交易日开盘卖出,每日等权(1/当日持仓数);"
+                      f"{ALGO_SLOT}:每只推荐固定成数(其余现金),新推荐挤掉最早买入的,"
+                      f"持有满 D 个交易日后到期全卖")
+    if "hold_days" not in st.session_state:
+        st.session_state.hold_days = int(_load_ui_prefs().get("hold_days", 5) or 5)
+
+    def _save_hold_days():
+        _save_ui_pref("hold_days", st.session_state.hold_days)
+
+    if st.session_state.algo == ALGO_FIXED:
+        st.number_input("持有交易日数 N(第 N+1 个交易日开盘卖出)",
+                        min_value=1, max_value=60, step=1, key="hold_days",
+                        on_change=_save_hold_days)
+
+    if "slot_w" not in st.session_state:
+        st.session_state.slot_w = float(_load_ui_prefs().get("slot_w", 1.0) or 1.0)
+
+    def _save_slot_w():
+        _save_ui_pref("slot_w", st.session_state.slot_w)
+
+    if "slot_d" not in st.session_state:
+        st.session_state.slot_d = int(_load_ui_prefs().get("slot_d", 10) or 10)
+
+    def _save_slot_d():
+        _save_ui_pref("slot_d", st.session_state.slot_d)
+
+    if st.session_state.algo == ALGO_SLOT:
+        st.number_input("每只仓位(成)", min_value=0.05, max_value=10.0, step=0.05,
+                        format="%.2f", key="slot_w", on_change=_save_slot_w,
+                        help="每只推荐固定占的仓位(1 成 = 10%);满仓 100% ÷ 每只成数 = "
+                             "每天最多持仓只数;其余资金为空仓现金")
+        st.number_input("持仓天数 D(第 D+1 个交易日开盘卖出)",
+                        min_value=1, max_value=120, step=1, key="slot_d",
+                        on_change=_save_slot_d,
+                        help="持有满 D 个交易日(买入日=第 1 天,停牌日不计)后到期全卖;"
+                             "期间新推荐挤掉最早买入的(FIFO 新老替换)")
+        st.caption(f"每天最多 {slot_capacity(st.session_state.slot_w / 10.0)} 只"
+                   f"(满仓 10 成 ÷ 每只 {st.session_state.slot_w:.2f} 成)")
+
+    # 仓位/防守文件(RULES.md):攻防转换用,固定读 input/ 下配置名,改文件后自动重解析
     regime_path = INPUT_DIR / REGIME_FILE_NAME
     if regime_path.exists():
         _parse_regime_into_state(regime_path)
-    else:
+    elif st.session_state.algo == ALGO_REGIME:
         st.warning(f"未找到 {REGIME_FILE_NAME},将退回「持有10个交易日」规则")
     regime_data = st.session_state.get("regime_data")
 
-    st.markdown("### ② 行情数据")
+    st.markdown("### ③ 行情数据")
     if not TS_TOKEN:
         st.error("config.py 中 TS_TOKEN 为空。请把旧脚本第 55 行的 token 粘贴到 config.py 后重启。")
     else:
@@ -811,7 +1106,7 @@ with st.sidebar:
                         status.update(label="更新失败", state="error")
                         st.error(f"tushare 连接失败,请检查 config.py 的 TS_TOKEN 和积分:{str(e)[:200]}")
 
-    st.markdown("### ③ 缓存状态")
+    st.markdown("### ④ 缓存状态")
     db_stats = fetcher.get_db_stats()
     st.caption(f"日线行数:{db_stats['bars']}  |  股票数:{db_stats['codes']}  |  "
                f"最新行情:{db_stats['latest']}")
@@ -838,9 +1133,17 @@ else:
     if regime_data:
         regime_key = (tuple(regime_data["regime"]), tuple(regime_data["defense"]))
     x_th, y_off, z_def, fee, gap_skip, prev_skip, mpd, limit_fill = _strategy_params()
+    algo = st.session_state.algo
+    hold_days = st.session_state.get("hold_days", 5)
+    slot_w = st.session_state.get("slot_w", 1.0)
+    slot_d = st.session_state.get("slot_d", 10)
     daily_holdings, portfolio, summary = _run_backtest(
         recs_tuple, regime_key, db_key, version, x_th, y_off, z_def, gap_skip,
-        prev_skip, mpd, limit_fill, fee, engine_ver=_engine_stamp())
+        prev_skip, mpd, limit_fill, fee, algo, hold_days,
+        slot_w / 10.0,   # 页面"成" → 规则/引擎小数口径;换算放在缓存 key 一侧,
+                         # 换算口径变化(如这次的 ÷10)会自然改变 key、使旧缓存失效
+        slot_d,
+        engine_ver=_engine_stamp())
 
     if portfolio.empty:
         st.info("数据库中还没有行情数据。点击侧边栏「初始化/更新行情数据」按钮。")
@@ -886,10 +1189,17 @@ else:
                     key=lambda s: s.map(order) if s.name == "操作" else s)
                 st.dataframe(style_holdings(show), width="stretch",
                              hide_index=True)
-                st.caption(f"仓位占比 = 等权 1/收盘持仓数,卖出的股票计 0%;"
-                           f"当日收益率:卖出=开盘涨跌幅,当日新买=实体涨幅,持有=全天涨跌幅(收盘/昨收-1);"
-                           f"账户收益率 = (1+昨日持仓今日平均开盘涨跌幅)×(1+今日持仓平均实体涨幅)-1;"
-                           f"累计收益自买入日起复利(买入日实体涨幅、之后全日涨跌幅)")
+                if algo == ALGO_SLOT:
+                    st.caption(f"仓位占比 = 每只固定 {slot_w} 成(其余为空仓现金,"
+                               f"净值按真实仓位计),卖出的股票计 0%;"
+                               f"当日收益率:卖出=开盘涨跌幅,当日新买=实体涨幅,持有=全天涨跌幅(收盘/昨收-1);"
+                               f"账户收益率 = (1+Σ昨日持仓成数×今日开盘涨跌幅)×(1+Σ今日持仓成数×实体涨幅)-1;"
+                               f"累计收益自买入日起复利(买入日实体涨幅、之后全日涨跌幅)")
+                else:
+                    st.caption(f"仓位占比 = 等权 1/收盘持仓数,卖出的股票计 0%;"
+                               f"当日收益率:卖出=开盘涨跌幅,当日新买=实体涨幅,持有=全天涨跌幅(收盘/昨收-1);"
+                               f"账户收益率 = (1+昨日持仓今日平均开盘涨跌幅)×(1+今日持仓平均实体涨幅)-1;"
+                               f"累计收益自买入日起复利(买入日实体涨幅、之后全日涨跌幅)")
 
     # ---------- Tab2 组合净值 ----------
     with tab_nav:
@@ -909,8 +1219,9 @@ else:
                 p_show["drawdown"] = nav_rel / nav_rel.cummax() - 1
             row = p_show[p_show["date"] == sel_dt].iloc[0]
             # 单押对照(X_THRESHOLD=0):与组合同区间、同口径重定基(首日=1)
+            # 仅攻防转换有意义(固定持有没有仓位阈值概念),固定持有下不展示
             dan_nav = None
-            if regime_key is not None:
+            if regime_key is not None and algo == ALGO_REGIME:
                 try:
                     dan_pf = _run_backtest_x0(recs_tuple, regime_key, db_key, version,
                                               y_off, z_def, gap_skip, prev_skip, mpd,
@@ -1112,8 +1423,11 @@ else:
                 issues.append(f"无行情数据:{'、'.join(dict.fromkeys(no_data['name']))}")
             not_entered = summary[summary["status"] == "未进场"]
             if not not_entered.empty:
-                issues.append(f"未进场 {len(not_entered)} 条(有行情但未进入最近 y 条目标窗口,"
-                              f"多为防守期发布的推荐,策略上不买入):"
+                _ne_reason = ("有行情但未进入最近 y 条目标窗口,多为防守期发布的推荐,策略上不买入"
+                              if algo == ALGO_REGIME
+                              else "推荐日之后有行情但从未买入(被更新推荐挤出窗口或数据异常,"
+                                   "请检查行情数据)")
+                issues.append(f"未进场 {len(not_entered)} 条({_ne_reason}):"
                               f"{'、'.join(dict.fromkeys(not_entered['name']))[:120]}…")
             pending = summary[summary["status"] == "未到买入日"]
             if not pending.empty:
@@ -1134,7 +1448,7 @@ else:
             df.to_excel(path, index=False, engine="openpyxl")
             return path
 
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
         with c1:
             if st.button("导出当日持仓表", width="stretch"):
                 sel = st.session_state.get("sel_date")
@@ -1160,28 +1474,180 @@ else:
                                        file_name=path.name)
                 else:
                     st.info("暂无数据可导出")
+        with c3:
+            if st.button("导出买入持有收益阶梯", width="stretch"):
+                if recs is not None and not recs.empty:
+                    market = _load_market(db_key, version)
+                    ladder = _build_hold_ladder(recs, market)
+                    # 末尾追加平均收益率行:每个收益率列对非空值求平均
+                    avg = {"股票代码": "平均收益率"}
+                    for col in ladder.columns[3:]:
+                        s = ladder[col].dropna()
+                        avg[col] = round(float(s.mean()), 6) if len(s) else None
+                    ladder = pd.concat([ladder, pd.DataFrame([avg])],
+                                       ignore_index=True)
+                    date_mat = _build_hold_date_matrix(recs, market)
+                    _ensure_dirs()
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    path = OUTPUT_DIR / f"收益阶梯_{ts}.xlsx"
+                    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+                        ladder.to_excel(writer, sheet_name="收益阶梯", index=False)
+                        date_mat.to_excel(writer, sheet_name="按日期对齐", index=False)
+                    from openpyxl import load_workbook
+                    wb = load_workbook(path)
+                    _style_ret_sheet(wb["收益阶梯"], start_col=4, freeze="D2",
+                                     bold_last_row=True)
+                    _style_ret_sheet(wb["按日期对齐"], start_col=4, freeze="D2",
+                                     bold_last_row=False)
+                    wb.save(path)
+                    st.success(f"已导出:{path}(收益阶梯 {len(ladder)} 行 × "
+                               f"{len(ladder.columns)} 列含平均行;"
+                               f"按日期对齐 {len(date_mat)} 行 × {len(date_mat.columns)} 列)")
+                    st.download_button("下载", path.read_bytes(),
+                                       file_name=path.name)
+                else:
+                    st.info("请先在侧边栏选择输入 Excel")
 
     # ---------- Tab5 交易计划 ----------
     with tab_plan:
-        if regime_data is None or recs is None or recs.empty:
-            st.info("需要仓位/防守文件与推荐数据,先在侧边栏选择输入 Excel")
+        if recs is None or recs.empty:
+            st.info("需要推荐数据,先在侧边栏选择输入 Excel")
+        elif algo == ALGO_FIXED:
+            last_closed, plan_date = _next_plan_date(recs)
+            if plan_date is None:
+                st.info("交易日历未覆盖下一交易日,点侧边栏「初始化/更新行情数据」补拉日历后重试")
+            else:
+                plan = _trade_plan_fixed(plan_date, last_closed, recs,
+                                         daily_holdings, hold_days)
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("计划日期", plan_date)
+                m2.metric("算法", f"固定持有{hold_days}日等权")
+                m3.metric("计划买入", f"{len(plan['buys'])} 只")
+                m4.metric("计划卖出", f"{len(plan['sells'])} 只")
+                for s in plan["notes"]:
+                    st.warning(s)
+
+                rows = []
+                for p in plan["sells"]:
+                    src = plan["cur"][p]
+                    rows.append({"操作": "卖出(到期)", "名称": src["name"],
+                                 "代码": src["ts_code"], "推荐日期": src["rec_date"],
+                                 "买入日期": src["entry_date"],
+                                 "已持有": f"{src['trade_days']} 个交易日"})
+                for _pos, ts, name, sd in plan["buys"]:
+                    rows.append({"操作": "买入(新增)", "名称": name, "代码": ts,
+                                 "推荐日期": sd, "买入日期": plan_date + "(计划)",
+                                 "已持有": "—"})
+                for p in plan["holds"]:
+                    src = plan["cur"][p]
+                    rows.append({"操作": "持有", "名称": src["name"],
+                                 "代码": src["ts_code"], "推荐日期": src["rec_date"],
+                                 "买入日期": src["entry_date"],
+                                 "已持有": f"{src['trade_days']} 个交易日"})
+                plan_df = pd.DataFrame(rows)
+                if plan_df.empty:
+                    st.info(f"{plan_date} 无持仓计划(空仓)")
+                else:
+                    order = {"卖出(到期)": 0, "买入(新增)": 1, "持有": 2}
+                    plan_df = plan_df.sort_values(
+                        "操作", key=lambda s: s.map(order)).reset_index(drop=True)
+                    st.dataframe(plan_df, width="stretch", hide_index=True)
+                # 快照存档:留痕"当天计划是什么"(行情/参数变了计划会变),供月度对照核对
+                if st.button("存档今日计划", key="btn_plan_snapshot"):
+                    snap = {
+                        "plan_date": plan_date,
+                        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "algo": ALGO_FIXED,
+                        "params": {"hold_days": hold_days},
+                        "cur_bars_date": plan["cur_date"],
+                        "actions": rows,
+                        "notes": plan["notes"],
+                    }
+                    snap_dir = OUTPUT_DIR / "plan_snapshots"
+                    snap_dir.mkdir(parents=True, exist_ok=True)
+                    snap_path = snap_dir / f"{plan_date}.json"
+                    snap_path.write_text(json.dumps(snap, ensure_ascii=False, indent=1),
+                                         encoding="utf-8")
+                    st.success(f"已存档 {plan_date} 计划 → {snap_path}")
+                st.caption(f"计划 = 固定持有{hold_days}日等权规则在计划日的交易:"
+                           "起始日期 ≤ 计划日且未持有未卖出的推荐开盘买入;"
+                           f"已持有满 {hold_days} 个交易日(含买入日,停牌日不计)的持仓计划日开盘卖出"
+                           "(即第 N+1 个交易日);其余持有,全部等权 1/持仓数。"
+                           "买入当日收益=实体涨幅,卖出当日收益=开盘涨跌幅;"
+                           "计划日停牌则实际顺延到下一个有行情交易日。"
+                           "决策依据与回测完全同源(rules.make_fixed_hold_rule)。")
+        elif algo == ALGO_SLOT:
+            last_closed, plan_date = _next_plan_date(recs)
+            if plan_date is None:
+                st.info("交易日历未覆盖下一交易日,点侧边栏「初始化/更新行情数据」补拉日历后重试")
+            else:
+                plan = _trade_plan_slot(plan_date, last_closed, recs,
+                                        daily_holdings, slot_w, slot_d)
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("计划日期", plan_date)
+                m2.metric("算法", f"限仓轮换 每只{slot_w}成×{slot_d}日")
+                m3.metric("计划买入", f"{len(plan['buys'])} 只")
+                m4.metric("计划卖出", f"{len(plan['sells'])} 只")
+                for s in plan["notes"]:
+                    st.warning(s)
+
+                rows = []
+                for p in plan["sells"]:
+                    src = plan["cur"][p]
+                    if src["trade_days"] >= slot_d:
+                        op, why = "卖出(到期)", f"持有满 {slot_d} 个交易日"
+                    else:
+                        op, why = "卖出(被替换)", "被更新推荐挤出(FIFO)"
+                    rows.append({"操作": op, "名称": src["name"], "代码": src["ts_code"],
+                                 "推荐日期": src["rec_date"], "买入日期": src["entry_date"],
+                                 "已持有": f"{src['trade_days']} 个交易日", "说明": why})
+                for _p, ts, name, sd in plan["buys"]:
+                    rows.append({"操作": "买入(新增)", "名称": name, "代码": ts,
+                                 "推荐日期": sd, "买入日期": plan_date + "(计划)",
+                                 "已持有": "—", "说明": f"固定 {slot_w} 成,其余现金"})
+                for p in plan["holds"]:
+                    src = plan["cur"][p]
+                    rows.append({"操作": "持有", "名称": src["name"],
+                                 "代码": src["ts_code"], "推荐日期": src["rec_date"],
+                                 "买入日期": src["entry_date"],
+                                 "已持有": f"{src['trade_days']} 个交易日", "说明": ""})
+                plan_df = pd.DataFrame(rows)
+                if plan_df.empty:
+                    st.info(f"{plan_date} 无持仓计划(空仓)")
+                else:
+                    order = {"卖出(到期)": 0, "卖出(被替换)": 1, "买入(新增)": 2, "持有": 3}
+                    plan_df = plan_df.sort_values(
+                        "操作", key=lambda s: s.map(order)).reset_index(drop=True)
+                    st.dataframe(plan_df, width="stretch", hide_index=True)
+                if st.button("存档今日计划", key="btn_plan_snapshot"):
+                    snap = {
+                        "plan_date": plan_date,
+                        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "algo": ALGO_SLOT,
+                        "params": {"weight": slot_w, "hold_days": slot_d},
+                        "cur_bars_date": plan["cur_date"],
+                        "actions": rows,
+                        "notes": plan["notes"],
+                    }
+                    snap_dir = OUTPUT_DIR / "plan_snapshots"
+                    snap_dir.mkdir(parents=True, exist_ok=True)
+                    snap_path = snap_dir / f"{plan_date}.json"
+                    snap_path.write_text(json.dumps(snap, ensure_ascii=False, indent=1),
+                                         encoding="utf-8")
+                    st.success(f"已存档 {plan_date} 计划 → {snap_path}")
+                st.caption(f"计划 = 限仓轮换规则在计划日的交易:目标 = 未卖出推荐中最新 "
+                           f"{plan['capacity']} 只(满仓 10 成 ÷ 每只 {slot_w} 成);"
+                           "计划日开盘买入目标内未持有的新推荐(每只固定成数,其余现金),"
+                           f"卖出不在目标的旧仓(被更新推荐 FIFO 挤出)与持有满 {slot_d} "
+                           "个交易日(含买入日,停牌日不计)的到期仓;其余持有。"
+                           "同日同股已合并为一个仓位。"
+                           "买入当日收益=实体涨幅,卖出当日收益=开盘涨跌幅;"
+                           "计划日停牌则实际顺延到下一个有行情交易日。"
+                           "决策依据与回测完全同源(rules.make_slot_rule)。")
+        elif regime_data is None:
+            st.info("攻防转换需要仓位/防守文件,先在侧边栏选择输入 Excel")
         else:
-            # 1. 计划日期 = 最后一个已收盘交易日(15:00)的下一交易日;日历补拉未来两周
-            now = datetime.now()
-            today = now.strftime("%Y-%m-%d")
-            try:
-                fetcher.ensure_trade_calendar(
-                    recs["start_date"].min(),
-                    (now + timedelta(days=14)).strftime("%Y-%m-%d"))
-            except Exception:
-                pass  # 日历补拉失败时先用库里已有的日历,缺未来日期则下方提示
-            tds_all = fetcher.load_trade_dates()   # 直查 DB(含未来日期),不走缓存
-            closed = [d for d in tds_all if d < today]
-            if today in tds_all and now.hour >= 15:
-                closed.append(today)               # 今天已过 15:00 收盘
-            last_closed = max(closed) if closed else None
-            after = [d for d in tds_all if last_closed and d > last_closed]
-            plan_date = after[0] if after else None
+            last_closed, plan_date = _next_plan_date(recs)
             if plan_date is None:
                 st.info("交易日历未覆盖下一交易日,点侧边栏「初始化/更新行情数据」补拉日历后重试")
             else:

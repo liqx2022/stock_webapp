@@ -6,20 +6,20 @@
 ## 运行
 
 ```bash
-.venv\Scripts\python.exe -m streamlit run app.py
 ```
+.venv\Scripts\python.exe -m streamlit run app.py
 
 ## 文件职责
 
-| 文件 | 职责 |
-|---|---|
-| app.py | Streamlit 页面(唯一入口):上传 Excel、更新行情、五个 tab(每日持仓/组合净值/回测明细/导出/交易计划) |
-| data_fetcher.py | tushare 全部交互、SQLite 建表与读写、增量更新(只拉缺口) |
-| backtest.py | 回测引擎:推荐记录 + 行情 + 规则 → 每日持仓/组合净值/个股汇总 |
-| rules.py | 买卖规则(可插拔)。**改规则只动本文件,不要改 backtest.py** |
+| 文件 | 职责                                                                                          |
+|---|---------------------------------------------------------------------------------------------|
+| app.py | Streamlit 页面(唯一入口):上传 Excel、更新行情、五个 tab(每日持仓/组合净值/回测明细/导出/交易计划)                             |
+| data_fetcher.py | tushare 全部交互、SQLite 建表与读写、增量更新(只拉缺口)                                                        |
+| backtest.py | 回测我引擎:推荐记录 + 行情 + 规则 → 每日持仓/组合净值/个股汇总                                                       |
+| rules.py | 买卖规则(可插拔)。**改规则只动本文件,不要改 backtest.py**                                                      |
 | monthly_compare.py | 独立命令行工具(不走 app):个人交割单 FIFO+盯市 vs 回测净值,逐月对照执行偏差;报告写 output/。个人行情缓存在 cache/personal_px.sqlite |
-| indicators.py | 指标定义(与旧脚本口径一致) |
-| config.py | token、列名映射、输入/仓位文件名与策略参数(含密钥,已 gitignore,不入库) |
+| indicators.py | 指标定义(与旧脚本口径一致)                                                                              |
+| config.py | token、列名映射、输入/仓位文件名与策略参数(含密钥,已 gitignore,不入库)                                               |
 
 ## 数据流
 
@@ -27,7 +27,15 @@
 
 ## 规则契约
 
-规则函数签名:`decide(date, holdings, bars, recs) -> list[Action]`,`Action(op, pos, weight)`,`op ∈ {buy, sell, sell_open}`(买入均开盘价;sell=收盘卖,sell_open=开盘卖,开盘卖当日收益=开盘涨跌幅)。`recs` 条目为 `(pos, ts_code, name, start_date)`,`pos` 是推荐唯一键,每条推荐是独立交易。当前规则:攻防转换(完整口径见 RULES.md,参数在 config.py 策略参数区):仓位 ≥ x 进攻持最近 y 条推荐,否则防守持最近 z 条防守列表;调仓一律开盘价成交,同股新旧仓同日合并(保留最早进场旧仓、不开新仓);引擎 fee 参数计手续费(费率在 config.py)。规则带状态,app.py 每次回测新建实例;改规则只动 rules.py。
+规则函数签名:`decide(date, holdings, bars, recs) -> list[Action]`,`Action(op, pos, weight)`,`op ∈ {buy, sell, sell_open}`(买入均开盘价;sell=收盘卖,sell_open=开盘卖,开盘卖当日收益=开盘涨跌幅)。`recs` 条目为 `(pos, ts_code, name, start_date)`,`pos` 是推荐唯一键,每条推荐是独立交易。规则带状态,app.py 每次回测新建实例;改规则只动 rules.py。
+
+三种算法(侧边栏「② 回测算法」切换,完整口径见 RULES.md):
+
+- **攻防转换**(默认):仓位 ≥ x 进攻持最近 y 条推荐,否则防守持最近 z 条防守列表(参数在 config.py 策略参数区);调仓一律开盘价成交,同股新旧仓同日合并(保留最早进场旧仓、不开新仓)
+- **固定持有N日等权**:推荐起始日开盘买入,持有 N 个交易日(页面选,默认 5),第 N+1 个交易日开盘卖出;每日等权 1/持仓数;攻防过滤参数不适用
+- **限仓轮换**:每只推荐固定成数(页面选,默认 1 成,其余现金),FIFO 新老替换(容量 = 满仓÷每只成数),持有 D 个交易日(默认 10)到期全卖;同日同股合并;攻防过滤参数不适用
+
+引擎 fee 参数计手续费(费率在 config.py)。限仓轮换的 action 带 weight → 引擎走**加权仓位模式**(按真实成数计收益/手续费,现金不计收益);其余两算法 weight=None,维持等权满仓口径,引擎两路径并存互不影响。
 
 ## 约定
 

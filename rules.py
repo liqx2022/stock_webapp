@@ -157,11 +157,115 @@ def open_at_limit_down(ts_code, open_, pre_close) -> bool:
     return _at_limit_price(ts_code, open_, pre_close, up=False)
 
 
+def make_fixed_hold_rule(hold_days: int = 5):
+    """固定持有 N 个交易日,第 N+1 个交易日开盘卖出;每日等权满仓(1/当日持仓数)。
+
+    买入:推荐起始日起第一个有行情的交易日,按开盘价(引擎口径,停牌自动顺延);
+    卖出:第 hold_days+1 个交易日开盘(sell_open,当日收益=开盘涨跌幅);
+    停牌日不计持有天数(买入/卖出都顺延到下一个有行情的交易日);
+    每日持仓 = 全部窗口内推荐(已买入且持有日数未满 N+1 天的 pos),
+      权重由引擎归一化等权——某日有 N 只在窗口内则每只占 1/N,
+      新推荐加入/老仓到期退出时权重自然摊薄/回升(引擎两因子口径);
+    每条推荐只做一轮,卖出后不再买入;同股再次推荐是新 pos,会再次买入;
+    不做攻防过滤(开盘涨幅/前收涨幅/涨跌停可成交性均为攻防规则的实盘近似,
+    固定持有口径保持纯粹:一律开盘价无条件成交)。
+
+    注意:本规则带内部状态(持有天数计数 + 已卖集合),一次回测必须传新实例,
+    app.py 的 _run_backtest 每次重跑都会新建,避免跨次回测状态残留。
+    """
+    if int(hold_days) < 1:
+        raise ValueError("hold_days 需为 >= 1 的整数")
+    held_days = {}   # pos -> 已持有交易日数(含买入日,停牌日不计数)
+    sold = set()     # 已卖出的 pos,防止同一推荐被再次买入
+
+    def rule(date, holdings, bars, recs):
+        actions = []
+        for pos in list(held_days):
+            if pos not in holdings:       # 引擎已移除(已卖出)的,清掉计数
+                del held_days[pos]
+        for pos, *_rest in recs:
+            if pos not in holdings and pos not in sold:
+                actions.append(Action("buy", pos, None))
+                held_days[pos] = 1        # 买入日 = 第 1 个交易日
+        for pos, h in holdings.items():
+            if h.code in bars:            # 停牌日不计持有天数(按股票代码查当日行情)
+                held_days[pos] = held_days.get(pos, 0) + 1
+                if held_days[pos] >= hold_days + 1:
+                    actions.append(Action("sell_open", pos, None))
+                    sold.add(pos)
+        return actions
+    return rule
+
+
+def slot_capacity(weight: float) -> int:
+    """限仓轮换容量 = 满仓(100%) / 每只成数(向下取整):1成(0.1)→10、0.5成(0.05)→20、
+    1.25成(0.125)→8、2成(0.2)→5。weight 为小数成数(0.1 = 1 成)。
+
+    round 规避浮点误差(1.0/0.1 = 9.9999...);app.py 交易计划页与规则共用,保证口径一致。
+    """
+    return int(round(1.0 / float(weight)))
+
+
+def make_slot_rule(weight: float, hold_days: int = 10):
+    """限仓轮换:每只推荐固定 weight 成仓位(其余现金),新老替换(FIFO),到期全卖。
+
+    买入:推荐起始日起第一个有行情的交易日,按开盘价(引擎口径,停牌顺延),
+      每只固定 weight(成数,如 0.1 = 1 成),行动带 weight → 引擎按真实仓位计
+      净值与手续费(其余资金为空仓现金,不参与收益);
+    容量:最多 floor(10 成 / weight) 只(1 成 → 10 只,0.5 成 → 20 只,2 成 → 5 只);
+    新老替换:新推荐使"未卖出推荐"数超过容量 → 卖掉最早推荐的(按推荐日期、
+      同日按行序)开盘卖出(sell_open),被挤出的推荐永不再买;
+    到期:持有满 hold_days 个交易日(买入日=第 1 天,停牌日不计)后,
+      第 hold_days+1 个交易日开盘卖出,干旱(无新推荐)时到期全卖、组合空仓;
+    同日同股合并由调用方完成(app.py 回测前 drop_duplicates);
+    每条推荐只做一轮,卖出后不再买入;同股再次推荐是新 pos,会再次买入;
+    攻防过滤不适用,一律开盘价无条件成交。
+
+    注意:本规则带内部状态(持有天数计数 + 已卖集合),一次回测必须传新实例。
+    """
+    if float(weight) <= 0:
+        raise ValueError("weight(每只成数)需 > 0")
+    if int(hold_days) < 1:
+        raise ValueError("hold_days 需为 >= 1 的整数")
+    weight = float(weight)
+    capacity = slot_capacity(weight)
+    held_days = {}   # pos -> 已持有交易日数(含买入日,停牌日不计数)
+    sold = set()     # 已卖出的 pos,防止同一推荐被再次买入
+
+    def rule(date, holdings, bars, recs):
+        actions = []
+        for pos in list(held_days):
+            if pos not in holdings:       # 引擎已移除(已卖出)的,清掉计数
+                del held_days[pos]
+        # 目标 = 未卖出推荐中"最新"的 capacity 只(推荐日期降序,同日行序靠前优先)
+        alive = [r for r in recs if r[0] not in sold]
+        newest_first = sorted(alive, key=lambda r: (r[3], -r[0]), reverse=True)
+        target = {r[0] for r in newest_first[:capacity]}
+        # 买入:目标集内未持有的(停牌无行情由引擎跳过,规则次日自然重发)
+        for pos, *_rest in recs:
+            if pos in target and pos not in holdings:
+                actions.append(Action("buy", pos, weight))
+                held_days[pos] = 1        # 买入日 = 第 1 个交易日
+        # 持有天数:停牌日不计(按股票代码查当日行情)
+        for pos, h in holdings.items():
+            if h.code in bars:
+                held_days[pos] = held_days.get(pos, 0) + 1
+        # 卖出:被挤出目标(FIFO 新老替换)或到期(held_days >= hold_days+1)的开盘卖
+        for pos in list(holdings):
+            if pos in target and held_days.get(pos, 0) < hold_days + 1:
+                continue
+            actions.append(Action("sell_open", pos, None))
+            sold.add(pos)
+        return actions
+    return rule
+
+
 def make_regime_rule(regime, defense_recs, x, y, z, max_open_gap=None,
                      prev_gain_skip=None, max_per_day=None, limit_fill_skip=False):
     """攻防转换规则(完整口径见 RULES.md;参数在 config.py)。
 
-    regime:       list[(start, end, position)],仓位区间,position 为"成"数(0~10)
+    regime:       list[(start, end, position)],仓位区间,position 为"成"数(0~10);
+                  区间重叠时行序靠后者覆盖靠前者(表尾追加新行修订旧区间)
     defense_recs: list[(pos, ts_code, name, start_date)],防守列表(与引擎 recs 同构)
     x:            仓位阈值,当日仓位 >= x → 进攻;仓位表未覆盖的日期按防守(保守)
     y / z:        进攻持有最近 y 条推荐 / 防守持有最近 z 条防守列表;同起始日期并列全部保留
@@ -201,10 +305,13 @@ def make_regime_rule(regime, defense_recs, x, y, z, max_open_gap=None,
     prev_bars = {}      # 上一交易日的 {ts_code: bar}(供前收涨幅过滤判定)
 
     def regime_position(date):
+        # 区间重叠时行序靠后者覆盖靠前者:表尾追加新行即可修订旧区间
+        # (与 app.py 交易计划页 _pos_of 同口径,改这里两边同时生效)
+        hit = None
         for start, end, position in regime:
             if start <= date <= end:
-                return position
-        return None  # 仓位表未覆盖 → 防守
+                hit = position
+        return hit  # 仓位表未覆盖 → None(防守)
 
     def rule(date, holdings, bars, recs):
         position = regime_position(date)
