@@ -665,6 +665,46 @@ def _date_nav(prefix: str, dates: list[str], label: str,
     return sel, start_str, end_str
 
 
+# ====================== 攻防贡献视图(只看进攻/只看防守,收益率归因) ======================
+REGIME_VIEWS = ["攻防都看", "只看进攻", "只看防守"]
+
+
+def _regime_labels(regime: list, dates: list[str], x: float) -> dict:
+    """逐日攻防标签:仓位表覆盖且当日仓位 >= x → 进攻;否则防守(未覆盖=防守,
+    保守口径;区间重叠行序靠后覆盖靠前——与 rules.regime_position 同口径)。"""
+    labels = {}
+    for d in dates:
+        pos = None
+        for s, e, p in regime:
+            if s <= d <= e:
+                pos = p
+        labels[d] = pos is not None and pos >= x
+    return labels
+
+
+def _regime_view_portfolio(portfolio: pd.DataFrame, regime: list, x: float,
+                           view: str) -> pd.DataFrame:
+    """攻防贡献视图:只看进攻 → 防守日 account_return/fee 置 0 并重算净值/回撤;
+    只看防守对称。持仓与交易明细不变,仅当日收益归因;净值从 1.0 起按
+    (1+account_return−fee) 逐日连乘(与引擎同口径、同舍入)。"""
+    labels = _regime_labels(regime, portfolio["date"].tolist(), x)
+    pf = portfolio.copy()
+    off = pd.Series([labels[d] for d in pf["date"]], index=pf.index)
+    zero = ~off if view == "只看进攻" else off
+    pf.loc[zero, "account_return"] = 0.0
+    pf.loc[zero, "fee"] = 0.0
+    nav, peak = 1.0, 1.0
+    navs, dds = [], []
+    for net in pf["account_return"] - pf["fee"]:
+        nav = round(nav * (1 + net), 6)
+        peak = max(peak, nav)
+        navs.append(nav)
+        dds.append(round(nav / peak - 1, 6) if peak > 0 else 0.0)
+    pf["nav"] = navs
+    pf["drawdown"] = dds
+    return pf
+
+
 # ====================== 买入持有收益阶梯(导出用,与算法无关) ======================
 def _hold_ladder_rows(merged: pd.DataFrame, market: pd.DataFrame):
     """逐条推荐产出 (ts_code, name, start_date, seq),seq = [(trade_date, 当日涨幅, 累计涨幅), ...]。
@@ -1067,6 +1107,19 @@ with st.sidebar:
         st.warning(f"未找到 {REGIME_FILE_NAME},将退回「持有10个交易日」规则")
     regime_data = st.session_state.get("regime_data")
 
+    # 攻防贡献视图:归因进攻/防守各自贡献(仅攻防转换 + 仓位文件存在时)
+    if st.session_state.algo == ALGO_REGIME and regime_data:
+        if "regime_view" not in st.session_state:
+            st.session_state.regime_view = _load_ui_prefs().get("regime_view", "攻防都看")
+
+        def _save_regime_view():
+            _save_ui_pref("regime_view", st.session_state.regime_view)
+
+        st.selectbox("攻防贡献视图", REGIME_VIEWS, key="regime_view",
+                     on_change=_save_regime_view,
+                     help="只看进攻:防守日收益率按 0 计(持仓与交易不变,净值只剩进攻日贡献);"
+                          "只看防守对称;用于对比收益是进攻还是防守贡献的多")
+
     st.markdown("### ③ 行情数据")
     if not TS_TOKEN:
         st.error("config.py 中 TS_TOKEN 为空。请把旧脚本第 55 行的 token 粘贴到 config.py 后重启。")
@@ -1145,6 +1198,15 @@ else:
         slot_d,
         engine_ver=_engine_stamp())
 
+    # 攻防贡献视图:全量 portfolio 留给导出,展示用的 portfolio 按视图过滤
+    # (持仓/交易不变,被过滤日的当日收益与费用置 0,净值/回撤重算)
+    portfolio_full = portfolio
+    regime_view = st.session_state.get("regime_view", "攻防都看")
+    if (algo == ALGO_REGIME and regime_key is not None
+            and regime_view != "攻防都看" and not portfolio.empty):
+        portfolio = _regime_view_portfolio(portfolio, regime_data["regime"],
+                                           x_th, regime_view)
+
     if portfolio.empty:
         st.info("数据库中还没有行情数据。点击侧边栏「初始化/更新行情数据」按钮。")
 
@@ -1200,6 +1262,10 @@ else:
                                f"当日收益率:卖出=开盘涨跌幅,当日新买=实体涨幅,持有=全天涨跌幅(收盘/昨收-1);"
                                f"账户收益率 = (1+昨日持仓今日平均开盘涨跌幅)×(1+今日持仓平均实体涨幅)-1;"
                                f"累计收益自买入日起复利(买入日实体涨幅、之后全日涨跌幅)")
+                if algo == ALGO_REGIME and regime_view != "攻防都看":
+                    st.caption(f"攻防贡献视图:当日为"
+                               f"{'防守' if regime_view == '只看进攻' else '进攻'}日,"
+                               f"收益率与费用按 0 计")
 
     # ---------- Tab2 组合净值 ----------
     with tab_nav:
@@ -1219,9 +1285,11 @@ else:
                 p_show["drawdown"] = nav_rel / nav_rel.cummax() - 1
             row = p_show[p_show["date"] == sel_dt].iloc[0]
             # 单押对照(X_THRESHOLD=0):与组合同区间、同口径重定基(首日=1)
-            # 仅攻防转换有意义(固定持有没有仓位阈值概念),固定持有下不展示
+            # 仅攻防转换有意义(固定持有没有仓位阈值概念),固定持有下不展示;
+            # 攻防贡献视图(只看进攻/防守)下净值被过滤,对照失真,同样隐藏
             dan_nav = None
-            if regime_key is not None and algo == ALGO_REGIME:
+            if regime_key is not None and algo == ALGO_REGIME \
+                    and regime_view == "攻防都看":
                 try:
                     dan_pf = _run_backtest_x0(recs_tuple, regime_key, db_key, version,
                                               y_off, z_def, gap_skip, prev_skip, mpd,
@@ -1298,6 +1366,10 @@ else:
                     out["超额"] = out["收益率"] - out["基准"]
                 return out
 
+            if regime_view != "攻防都看":
+                st.caption(f"攻防贡献视图:{'防守' if regime_view == '只看进攻' else '进攻'}"
+                           "日收益率按 0 计(持仓与交易明细不变,净值/回撤按过滤后重算);"
+                           "单押对照已隐藏")
             sub_day, sub_month, sub_year = st.tabs(["日收益", "月收益", "年收益"])
             with sub_day:
                 _has_bench_card = (bench_sel == "单押" and dan_nav is not None) \
@@ -1466,7 +1538,8 @@ else:
                     path = _write_export(pd.DataFrame(), "回测报表")
                     with pd.ExcelWriter(path, engine="openpyxl") as writer:
                         summary.to_excel(writer, sheet_name="个股汇总", index=False)
-                        portfolio.drop(columns=["_dt"]).to_excel(
+                        # 导出始终用全量回测(不受攻防贡献视图过滤影响)
+                        portfolio_full.drop(columns=["_dt"], errors="ignore").to_excel(
                             writer, sheet_name="每日组合", index=False)
                         daily_holdings.to_excel(writer, sheet_name="每日持仓明细", index=False)
                     st.success(f"已导出:{path}")
